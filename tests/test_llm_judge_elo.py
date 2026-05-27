@@ -182,3 +182,36 @@ def test_judge_api_usage_updates_tokens_and_configured_cost():
     assert loop._judge_total_tokens == 3000
     assert loop._judge_cost_usd == pytest.approx(0.005)
     assert loop._iter_cost == pytest.approx(0.005)
+
+
+def test_judge_api_usage_uses_default_openai_pricing():
+    loop = object.__new__(SelfImprovingLoop)
+    loop.config = LoopConfig(judge_log_details=False)
+    loop._iter_cost = 0.0
+    loop._judge_cost_usd = 0.0
+    loop._judge_prompt_tokens = 0
+    loop._judge_completion_tokens = 0
+    loop._judge_total_tokens = 0
+
+    usage = types.SimpleNamespace(prompt_tokens=1_000_000, completion_tokens=1_000_000)
+
+    loop._record_judge_api_usage("openai", "openai/gpt-5-nano", usage)
+
+    assert loop._judge_cost_usd == pytest.approx(0.45)
+    assert loop._iter_cost == pytest.approx(0.45)
+
+
+def test_judge_api_usage_maps_versioned_nano_to_nano_pricing():
+    loop = object.__new__(SelfImprovingLoop)
+    loop.config = LoopConfig(judge_log_details=False)
+    loop._iter_cost = 0.0
+    loop._judge_cost_usd = 0.0
+    loop._judge_prompt_tokens = 0
+    loop._judge_completion_tokens = 0
+    loop._judge_total_tokens = 0
+
+    usage = types.SimpleNamespace(prompt_tokens=1_000_000, completion_tokens=1_000_000)
+
+    loop._record_judge_api_usage("openai", "openai/gpt-5.4-nano", usage)
+
+    assert loop._judge_cost_usd == pytest.approx(0.45)

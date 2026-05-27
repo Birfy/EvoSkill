@@ -88,8 +88,8 @@ class LoopConfig:
     judge_elo_scale: float = 400.0
     judge_log_details: bool = True
     # Optional direct-judge price overrides in USD per 1M tokens. Direct API
-    # responses expose token usage but not provider billing, so cost remains
-    # 0 unless these are configured.
+    # responses expose token usage but not provider billing; when these are not
+    # set, known OpenAI model prices are used for estimation.
     judge_input_cost_per_1m: float | None = None
     judge_output_cost_per_1m: float | None = None
     # PUCT tree search for LLM-judge evolution mode.

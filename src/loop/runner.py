@@ -81,6 +81,23 @@ T = TypeVar("T")
 
 TOLERANCE_LEVELS = [0.05, 0.01, 0.1, 0.0, 0.025]
 
+# USD per 1M tokens for direct judge API cost estimation.
+# These are intentionally conservative model-name mappings; explicit config
+# overrides still win when a provider or account uses a different route.
+OPENAI_JUDGE_PRICE_PER_1M: dict[str, tuple[float, float]] = {
+    "gpt-5.4": (2.50, 15.00),
+    "gpt-5.2": (1.75, 14.00),
+    "gpt-5.1": (1.25, 10.00),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
+}
+
 
 @dataclass
 class LoopAgents:
@@ -1165,6 +1182,29 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     return 0
         return 0
 
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        return model.split("/", 1)[-1].strip().lower()
+
+    @staticmethod
+    def _default_judge_price_per_1m(provider: str, model: str) -> tuple[float | None, float | None]:
+        """Return default direct judge pricing as USD per 1M input/output tokens."""
+        if provider != "openai":
+            return None, None
+        normalized = SelfImprovingLoop._normalize_model_name(model)
+        if normalized in OPENAI_JUDGE_PRICE_PER_1M:
+            return OPENAI_JUDGE_PRICE_PER_1M[normalized]
+
+        # Treat versioned nano/mini suffixes as their closest published family
+        # price unless an explicit override is provided.
+        if normalized.startswith("gpt-5.") and normalized.endswith("-nano"):
+            return OPENAI_JUDGE_PRICE_PER_1M["gpt-5-nano"]
+        if normalized.startswith("gpt-5.") and normalized.endswith("-mini"):
+            return OPENAI_JUDGE_PRICE_PER_1M["gpt-5-mini"]
+        if normalized.startswith("gpt-5.") and "-pro" not in normalized:
+            return OPENAI_JUDGE_PRICE_PER_1M["gpt-5.4"]
+        return None, None
+
     def _record_judge_api_usage(self, provider: str, model: str, usage: Any) -> None:
         """Record direct judge token usage and estimated cost."""
         input_tokens = self._usage_value(
@@ -1186,6 +1226,13 @@ and modify it to add these capabilities. Preserve all existing content that is s
         config = getattr(self, "config", None)
         input_rate = getattr(config, "judge_input_cost_per_1m", None)
         output_rate = getattr(config, "judge_output_cost_per_1m", None)
+        if input_rate is None or output_rate is None:
+            default_input_rate, default_output_rate = self._default_judge_price_per_1m(
+                provider,
+                model,
+            )
+            input_rate = default_input_rate if input_rate is None else input_rate
+            output_rate = default_output_rate if output_rate is None else output_rate
         if input_rate is None or output_rate is None:
             return
 

@@ -332,14 +332,14 @@ class LoopSettings(BaseSettings):
         default=None,
         description=(
             "Optional direct judge input-token price in USD per 1M tokens. "
-            "When omitted, judge token usage is tracked but judge cost is $0."
+            "When omitted, known OpenAI model prices are used when available."
         ),
     )
     judge_output_cost_per_1m: Optional[float] = Field(
         default=None,
         description=(
             "Optional direct judge output-token price in USD per 1M tokens. "
-            "When omitted, judge token usage is tracked but judge cost is $0."
+            "When omitted, known OpenAI model prices are used when available."
         ),
     )
     puct_c: float = Field(
