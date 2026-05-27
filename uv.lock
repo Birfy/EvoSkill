@@ -1277,6 +1277,7 @@ name = "evoskill"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anthropic" },
     { name = "claude-agent-sdk" },
     { name = "click" },
     { name = "daytona" },
@@ -1321,6 +1322,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anthropic", specifier = ">=0.40.0" },
     { name = "claude-agent-sdk", specifier = ">=0.1.16" },
     { name = "click", specifier = ">=8.1.8" },
     { name = "datasets", marker = "extra == 'eval'", specifier = ">=4.6.0" },
