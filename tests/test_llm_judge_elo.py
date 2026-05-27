@@ -72,6 +72,17 @@ def test_rating_to_score_uses_base_as_global_anchor():
     assert SelfImprovingLoop._rating_to_score(1500.0, 1500.0, 0.65, 400.0) == 0.65
 
 
+def test_rating_to_score_keeps_weaker_nodes_below_base():
+    score = SelfImprovingLoop._rating_to_score(
+        rating=1400.0,
+        anchor_rating=1500.0,
+        base_score=0.65,
+        scale=400.0,
+    )
+
+    assert 0.0 < score < 0.65
+
+
 def test_puct_node_balances_q_prior_and_visits():
     parent_visits = 10
     high_q = ProgramSearchNode("high-q", None, prior=0.1, score=0.8, visit_count=4, total_q=3.2)

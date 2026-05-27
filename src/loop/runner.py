@@ -1327,10 +1327,18 @@ and modify it to add these capabilities. Preserve all existing content that is s
         base_score: float,
         scale: float,
     ) -> float:
-        """Map a global rating advantage over base to the score space."""
+        """Map a global rating advantage over base to the score space.
+
+        Equal rating maps to the observed base score. Ratings above base consume
+        the remaining headroom toward 1.0; ratings below base consume the
+        downside room toward 0.0. This preserves BT ordering instead of
+        collapsing all weaker-than-base nodes onto the base score.
+        """
         expected_win_rate = SelfImprovingLoop._elo_expected(rating, anchor_rating, scale)
-        fix_rate = max(0.0, min(1.0, 2.0 * (expected_win_rate - 0.5)))
-        return base_score + fix_rate * (1.0 - base_score)
+        centered = max(-1.0, min(1.0, 2.0 * (expected_win_rate - 0.5)))
+        if centered >= 0.0:
+            return base_score + centered * (1.0 - base_score)
+        return base_score + centered * base_score
 
     @staticmethod
     def _judge_binary_to_match_score(would_succeed: bool, confidence: float) -> float:
