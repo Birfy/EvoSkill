@@ -94,6 +94,19 @@ def test_puct_selection_returns_expandable_node_before_saturated_path():
     assert selected is first
 
 
+def test_puct_selection_descends_before_filling_unsaturated_root():
+    loop = object.__new__(SelfImprovingLoop)
+    loop.config = LoopConfig(puct_children_per_node=4, puct_max_depth=2, puct_c=0.5)
+
+    root = ProgramSearchNode("base", None, score=0.6, visit_count=2, total_q=1.2)
+    first = ProgramSearchNode("iter-1", root, prior=0.9, score=0.8, visit_count=1, total_q=0.8, depth=1)
+    root.children.append(first)
+
+    selected = loop._select_puct_node(root)
+
+    assert selected is first
+
+
 def test_invalid_judge_match_is_neutral_and_marked_invalid():
     match = JudgeMatchResult(
         index=1,

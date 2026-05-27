@@ -20,6 +20,7 @@ def build_proposer_query(
     truncation_level: int = 0,
     task_constraints: str = "",
     project_root: str | Path | None = None,
+    diversity_hint: str = "",
 ) -> str:
     """Build the query for the proposer agent from multiple failure traces.
 
@@ -29,6 +30,7 @@ def build_proposer_query(
         evolution_mode: "skill_only" or "prompt_only" - affects trace truncation.
         truncation_level: Context reduction level (0=full, 1=moderate, 2=aggressive).
         task_constraints: Optional task-specific constraints to include in the query.
+        diversity_hint: Optional instruction to make sibling child proposals differ.
 
     Returns:
         Formatted query string for the proposer.
@@ -91,10 +93,16 @@ Ground Truth: {ground_truth}
     failures_text = "\n".join(failure_sections)
 
     constraints_section = f"\n## Task Constraints\n{task_constraints}\n" if task_constraints else ""
+    diversity_section = (
+        f"\n## Diversity Requirement\n{diversity_hint.strip()}\n"
+        if diversity_hint.strip()
+        else ""
+    )
 
     return f"""## Existing Skills (check before proposing new ones)
 {skills_list}
 {constraints_section}
+{diversity_section}
 ## Previous Attempts Feedback
 {feedback_history}
 

@@ -339,8 +339,7 @@ EVOSKILL_NO_GIT=1 python scripts/run_loop.py \
   --puct_c 0.5 \
   --puct_max_depth 3 \
   --puct_children_per_node 4 \
-  --children_per_iteration 2 \
-  --judge_eval_samples 8
+  --children_per_iteration 2
 ```
 
 Important options:
@@ -350,7 +349,6 @@ Important options:
 | `--trajectories_dir` | Loads pre-collected trajectories and skips agent inference during evolution. |
 | `--use_llm_judge true` | Scores candidate skills with direct judge calls instead of full validation reruns. |
 | `--judge_scoring bradley_terry` | Maintains a global pairwise rating table so nodes in the tree are comparable. |
-| `--judge_eval_samples N` | Uses a fixed capped set of base failures to judge every child. Use this to control cost on large failure sets. |
 | `--children_per_iteration N` | Generates multiple children from the selected PUCT parent in one iteration. |
 | `--puct_children_per_node N` | Caps how many children each tree node can expand. |
 | `--puct_default_prior X` | Fallback PUCT prior when the proposer does not return confidence. |
@@ -474,7 +472,7 @@ The offline path supports:
 - Multiple child candidates per selected parent.
 - LLM judge scoring from pre-collected failures.
 - Global Bradley-Terry fitting for comparable node ratings.
-- A fixed judge eval set with `--judge_eval_samples` to keep scoring stable and bounded.
+- Anchor comparisons against parent, base, current best, and frontier nodes to keep the global rating graph connected.
 
 ### `evoskill diff`
 
@@ -703,7 +701,7 @@ Offline judge mode changes the evaluation stage:
 1. Run the base agent once and store complete trajectories.
 2. Compute the base score and collect base failures.
 3. Sample a small proposal batch from the failures to generate candidate skill edits.
-4. Judge every candidate on a fixed, capped judge eval set of base failures.
+4. Judge every candidate on the current proposal batch against parent/base/frontier anchors.
 5. Use the judge results to update the search tree and frontier without re-running the full agent.
 
 This mode is intended for expensive agent runs. It trades exact validation for faster skill search, and top candidates should still be re-run with `evoskill eval` or a benchmark-specific evaluator before deployment.
@@ -730,7 +728,7 @@ This avoids treating a local `child vs parent` Elo result as a global score. The
 ```text
 global Bradley-Terry rating -> node value / frontier ranking
 proposer confidence         -> PUCT prior
-fixed judge eval set        -> comparable evidence for every child
+anchor comparisons          -> connected evidence across the whole tree
 ```
 
 ## Git Branches

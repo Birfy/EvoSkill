@@ -568,6 +568,7 @@ class SelfImprovingLoop:
         failures: list[tuple[AgentTrace[AgentResponse], str, str, str]],
         iteration: int | str,
         truncation_level: int = 0,
+        diversity_hint: str = "",
     ) -> tuple[str, str, str, float] | None:
         """Run proposer and generator to create a mutation based on multiple failures.
 
@@ -576,6 +577,7 @@ class SelfImprovingLoop:
             failures: List of (trace, agent_answer, ground_truth, category) tuples from failed attempts.
             iteration: Current iteration number.
             truncation_level: Context reduction level (0=full, 1=moderate, 2=aggressive).
+            diversity_hint: Optional instruction used to diversify sibling children.
 
         Returns:
             Tuple of (child_name, proposal, justification, proposer_confidence)
@@ -592,7 +594,15 @@ class SelfImprovingLoop:
         evolution_mode = self.config.evolution_mode
         _log("", f"  -> Running {evolution_mode.replace('_only', '')} proposer with {len(failures)} failures...")
         feedback_history = read_feedback_history(self._feedback_path)
-        proposer_query = build_proposer_query(failures, feedback_history, evolution_mode, truncation_level, self.task_constraints, project_root=self._project_root)
+        proposer_query = build_proposer_query(
+            failures,
+            feedback_history,
+            evolution_mode,
+            truncation_level,
+            self.task_constraints,
+            project_root=self._project_root,
+            diversity_hint=diversity_hint,
+        )
 
         if evolution_mode == "skill_only":
             proposer_trace = await self.agents.skill_proposer.run(proposer_query)
@@ -717,6 +727,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
         parent: str,
         failures: list[tuple[AgentTrace[AgentResponse], str, str, str]],
         iteration: int | str,
+        diversity_hint: str = "",
     ) -> tuple[str, str, str, float] | None:
         """Try progressive truncation levels, then single-failure fallback.
 
@@ -724,6 +735,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
             parent: Name of the parent program.
             failures: List of (trace, agent_answer, ground_truth, category) tuples.
             iteration: Current iteration number.
+            diversity_hint: Optional instruction used to diversify sibling children.
 
         Returns:
             Tuple of (child_name, proposal, justification, proposer_confidence)
@@ -735,7 +747,13 @@ and modify it to add these capabilities. Preserve all existing content that is s
             if truncation_level > 0:
                 _log("", f"  -> Retrying with truncation level {truncation_level}...")
 
-            result = await self._mutate(parent, failures, iteration, truncation_level)
+            result = await self._mutate(
+                parent,
+                failures,
+                iteration,
+                truncation_level,
+                diversity_hint=diversity_hint,
+            )
             if result is not None:
                 return result
 
@@ -743,7 +761,13 @@ and modify it to add these capabilities. Preserve all existing content that is s
         if self.config.proposer_single_failure_fallback and len(failures) > 1:
             _log("", f"  -> All truncation levels failed, trying single-failure fallback...")
             single_failure = self._pick_shortest_failure(failures)
-            result = await self._mutate(parent, [single_failure], iteration, truncation_level=max_level)
+            result = await self._mutate(
+                parent,
+                [single_failure],
+                iteration,
+                truncation_level=max_level,
+                diversity_hint=diversity_hint,
+            )
             if result is not None:
                 return result
 
@@ -892,6 +916,62 @@ and modify it to add these capabilities. Preserve all existing content that is s
             if skill_dir.is_dir() and skill_file.exists():
                 parts.append(f"### Skill: {skill_dir.name}\n{skill_file.read_text()}")
         return "\n\n".join(parts) if parts else "No skills available."
+
+    def _get_program_skills_content(self, program_name: str, restore_to: str | None = None) -> str:
+        """Read active skills for a stored program and optionally restore another program."""
+        try:
+            self.manager.switch_to(program_name)
+            return self._get_all_skills_content()
+        finally:
+            if restore_to is not None:
+                self.manager.switch_to(restore_to)
+
+    def _select_bt_anchor_nodes(self, parent: str, child_name: str) -> list[str]:
+        """Choose globally connected Bradley-Terry anchors for a new child."""
+        candidates: list[str] = [parent, "base"]
+        best = self.manager.get_best_from_frontier()
+        if best:
+            candidates.append(best)
+        candidates.extend(name for name, _score in self.manager.get_frontier_with_scores()[:2])
+
+        existing = set(self.manager.list_programs())
+        anchors: list[str] = []
+        for name in candidates:
+            if name == child_name or name not in existing or name in anchors:
+                continue
+            anchors.append(name)
+        return anchors
+
+    @staticmethod
+    def _build_child_diversity_hint(child_idx: int, sibling_proposals: list[str]) -> str:
+        """Build proposer guidance so sibling children explore different fixes."""
+        strategies = [
+            (
+                "For this child, prefer the smallest targeted edit to an existing "
+                "relevant skill. Focus on the most direct reusable verification gap."
+            ),
+            (
+                "For this child, propose an alternative root-cause hypothesis. "
+                "Do not repeat the first child's target skill, checks, or workflow unless unavoidable."
+            ),
+            (
+                "For this child, prefer a broader workflow-level capability or a new "
+                "specialized skill if editing an existing skill would only patch symptoms."
+            ),
+            (
+                "For this child, deliberately choose a different intervention type "
+                "from earlier siblings, with different trigger conditions and verification steps."
+            ),
+        ]
+        base_hint = strategies[min(child_idx, len(strategies) - 1)]
+        if not sibling_proposals:
+            return base_hint
+
+        prior = "\n".join(f"- {proposal[:240]}" for proposal in sibling_proposals)
+        return (
+            f"{base_hint}\n\nAlready proposed sibling changes in this expansion:\n{prior}\n"
+            "Your proposal must be materially different in target, root cause, or verification method."
+        )
 
     @staticmethod
     def _summarize_skill_content(content: str, max_chars: int = 3500) -> str:
@@ -1144,30 +1224,31 @@ and modify it to add these capabilities. Preserve all existing content that is s
     def _select_puct_node(self, root: ProgramSearchNode) -> ProgramSearchNode:
         """Select a program node to expand using PUCT.
 
-        A node may be expanded until it reaches ``puct_children_per_node``.
-        Once saturated, tree policy descends through the child with the highest
-        PUCT score. If that path reaches max depth, choose the best remaining
-        expandable node anywhere in the tree.
+        Selection starts at the root and repeatedly follows the child with the
+        highest PUCT score until it reaches a leaf or max depth. The selected
+        leaf is then expanded if it still has child capacity. This keeps Q
+        values and policy priors in the tree policy instead of filling every
+        slot on the current node before descent.
         """
         node = root
         while True:
-            if (
-                node.depth < self.config.puct_max_depth
-                and len(node.children) < self.config.puct_children_per_node
-            ):
-                return node
-
             live_children = [child for child in node.children if not child.discarded]
+
             if not live_children:
+                if (
+                    node.depth < self.config.puct_max_depth
+                    and len(node.children) < self.config.puct_children_per_node
+                ):
+                    return node
+                break
+
+            if node.depth >= self.config.puct_max_depth:
                 break
 
             node = max(
                 live_children,
                 key=lambda child: child.puct_score(self.config.puct_c, node.visit_count),
             )
-
-            if node.depth >= self.config.puct_max_depth:
-                break
 
         expandable = self._collect_expandable_puct_nodes(root)
         if not expandable:
@@ -1195,36 +1276,6 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
         visit(root)
         return nodes
-
-    def _build_fixed_judge_eval_set(
-        self,
-        failures: list[tuple[AgentTrace, str, str, str, str]],
-    ) -> list[tuple[AgentTrace, str, str, str, str]]:
-        """Build a deterministic capped judge set from base failures."""
-        limit = self.config.judge_eval_sample_count
-        if limit is None or limit <= 0 or limit >= len(failures):
-            return list(failures)
-
-        by_category: dict[str, list[tuple[AgentTrace, str, str, str, str]]] = {}
-        for failure in failures:
-            by_category.setdefault(failure[4], []).append(failure)
-
-        selected: list[tuple[AgentTrace, str, str, str, str]] = []
-        categories = sorted(by_category)
-        offset = 0
-        while len(selected) < limit and categories:
-            made_progress = False
-            for category in categories:
-                pool = by_category[category]
-                if offset < len(pool):
-                    selected.append(pool[offset])
-                    made_progress = True
-                    if len(selected) >= limit:
-                        break
-            if not made_progress:
-                break
-            offset += 1
-        return selected
 
     def _sample_proposal_failures(
         self,
@@ -1588,17 +1639,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
             "COLLECT",
             f"Base score: {base_score:.4f} ({passed}/{total} passed, {len(all_failures_ext)} failures)",
         )
-        judge_eval_failures_ext = self._build_fixed_judge_eval_set(all_failures_ext)
-        if self.config.judge_eval_sample_count and self.config.judge_eval_sample_count > 0:
-            _log(
-                "JUDGE",
-                (
-                    f"Fixed judge eval set: {len(judge_eval_failures_ext)}/"
-                    f"{len(all_failures_ext)} base failures"
-                ),
-            )
-        else:
-            _log("JUDGE", "Fixed judge eval set disabled; using each proposal batch for scoring")
+        _log("JUDGE", "Using each proposal batch for scoring; no fixed judge set")
         self.manager.update_frontier("base", base_score, max_size=self.config.frontier_size)
         self._emit("baseline", score=base_score, n_skills=len(self._get_active_skills()))
         search_root = self._build_program_search_tree(base_score)
@@ -1658,11 +1699,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 break
 
             batch_failures_ext = self._sample_proposal_failures(all_failures_ext, categories)
-            scoring_failures_ext = (
-                judge_eval_failures_ext
-                if self.config.judge_eval_sample_count and self.config.judge_eval_sample_count > 0
-                else batch_failures_ext
-            )
+            scoring_failures_ext = batch_failures_ext
 
             # Convert to legacy format (trace, agent_answer, ground_truth, category) for _mutate
             batch_failures = [(t, ans, gt, cat) for t, _q, ans, gt, cat in batch_failures_ext]
@@ -1694,6 +1731,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
             )
             any_child_added = False
             any_child_created = False
+            sibling_proposals: list[str] = []
 
             for child_idx in range(children_to_generate):
                 self.manager.switch_to(parent)
@@ -1707,10 +1745,12 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     "CHILD",
                     f"{child_idx + 1}/{children_to_generate} from parent {parent}",
                 )
+                diversity_hint = self._build_child_diversity_hint(child_idx, sibling_proposals)
                 mutation_result = await self._mutate_with_fallback(
                     parent,
                     batch_failures,
                     child_iteration_id,
+                    diversity_hint=diversity_hint,
                 )
 
                 if mutation_result is None:
@@ -1719,6 +1759,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
                 any_child_created = True
                 child_name, proposal, justification, proposer_confidence = mutation_result
+                sibling_proposals.append(proposal)
                 candidate_skills_content = self._get_all_skills_content()
                 parent_skill_summary = self._summarize_skill_content(parent_skills_content)
                 candidate_skill_summary = self._summarize_skill_content(candidate_skills_content)
@@ -1744,18 +1785,51 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 # failed samples the child is expected to recover. Scale it to the
                 # observed base-score space.
                 if self.config.judge_scoring == "bradley_terry":
-                    bt_players.update({parent, child_name})
-                    bt_matches.extend(
+                    anchors = self._select_bt_anchor_nodes(parent, child_name)
+                    anchor_results: list[tuple[str, JudgeResult]] = [(parent, judge_result)]
+                    extra_anchors = [anchor for anchor in anchors if anchor != parent]
+                    if extra_anchors:
+                        _log("JUDGE", f"BT anchors for {child_name}: {', '.join(anchors)}")
+                    for anchor in extra_anchors:
+                        anchor_skills_content = self._get_program_skills_content(
+                            anchor,
+                            restore_to=child_name,
+                        )
+                        anchor_skill_summary = self._summarize_skill_content(anchor_skills_content)
+                        anchor_diff = self._diff_skill_content(
+                            anchor_skills_content,
+                            candidate_skills_content,
+                        )
+                        _log("", f"  -> Anchor judging {child_name} vs {anchor}...")
+                        anchor_result = await self._judge_skill_with_llm(
+                            scoring_failures_ext,
+                            judge_provider,
+                            judge_model,
+                            child_name=child_name,
+                            parent_name=anchor,
+                            proposal=proposal,
+                            justification=justification,
+                            parent_skill_summary=anchor_skill_summary,
+                            candidate_skill_summary=candidate_skill_summary,
+                            skill_diff=anchor_diff,
+                            candidate_skills_content=candidate_skills_content,
+                        )
+                        anchor_results.append((anchor, anchor_result))
+
+                    bt_players.update({child_name, *anchors})
+                    new_bt_matches = [
                         BradleyTerryMatch(
                             player=child_name,
-                            opponent=parent,
+                            opponent=anchor,
                             score=match.match_score,
                             category=match.category,
                             index=match.index,
                         )
-                        for match in judge_result.matches
+                        for anchor, result in anchor_results
+                        for match in result.matches
                         if match.valid
-                    )
+                    ]
+                    bt_matches.extend(new_bt_matches)
                     bt_ratings = self._fit_bradley_terry_ratings(
                         bt_matches,
                         sorted(bt_players),
@@ -1801,7 +1875,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         (
                             f"  -> Judge BT: global_rating={child_rating:.1f} "
                             f"base_rating={base_rating:.1f}, expected_vs_base={expected_win:.3f}, "
-                            f"avg_match={judge_result.average_match_score:.3f} "
+                            f"avg_match={sum(m.score for m in new_bt_matches) / len(new_bt_matches):.3f} "
+                            f"matches={len(new_bt_matches)} anchors={len(anchors)} "
                             f"→ global score {child_score:.4f}"
                         ),
                     )

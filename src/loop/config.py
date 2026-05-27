@@ -87,12 +87,6 @@ class LoopConfig:
     judge_elo_k: float = 128.0
     judge_elo_scale: float = 400.0
     judge_log_details: bool = True
-    # Optional fixed judge set size for LLM-judge scoring. When set, proposal
-    # generation may still use a small rotating batch, but every child is judged
-    # against the same capped set of base failures for comparable scores.
-    # None or <=0 means use the per-iteration proposal batch for judging.
-    judge_eval_sample_count: int | None = None
-
     # PUCT tree search for LLM-judge evolution mode.
     puct_c: float = 0.5
     puct_max_depth: int = 3

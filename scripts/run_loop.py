@@ -328,13 +328,6 @@ class LoopSettings(BaseSettings):
         default=True,
         description="Print per-sample judge JSON, match scores, and Elo updates.",
     )
-    judge_eval_samples: Optional[int] = Field(
-        default=None,
-        description=(
-            "Fixed number of base-failure trajectories used to judge every child. "
-            "Unset or <=0 keeps using each iteration's sampled proposal batch."
-        ),
-    )
     puct_c: float = Field(
         default=0.5,
         description="PUCT exploration constant for LLM-judge run-loop tree search.",
@@ -541,7 +534,6 @@ async def main(settings: LoopSettings):
         judge_elo_k=settings.judge_elo_k,
         judge_elo_scale=settings.judge_elo_scale,
         judge_log_details=settings.judge_log_details,
-        judge_eval_sample_count=settings.judge_eval_samples,
         puct_c=settings.puct_c,
         puct_max_depth=settings.puct_max_depth,
         puct_children_per_node=settings.puct_children_per_node,
