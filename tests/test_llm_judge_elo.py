@@ -158,3 +158,27 @@ def test_openai_gpt5_judge_uses_max_completion_tokens(monkeypatch):
 
     assert captured["max_completion_tokens"] == 512
     assert "max_tokens" not in captured
+
+
+def test_judge_api_usage_updates_tokens_and_configured_cost():
+    loop = object.__new__(SelfImprovingLoop)
+    loop.config = LoopConfig(
+        judge_input_cost_per_1m=1.0,
+        judge_output_cost_per_1m=2.0,
+        judge_log_details=False,
+    )
+    loop._iter_cost = 0.0
+    loop._judge_cost_usd = 0.0
+    loop._judge_prompt_tokens = 0
+    loop._judge_completion_tokens = 0
+    loop._judge_total_tokens = 0
+
+    usage = types.SimpleNamespace(prompt_tokens=1000, completion_tokens=2000, total_tokens=3000)
+
+    loop._record_judge_api_usage("openai", "test-model", usage)
+
+    assert loop._judge_prompt_tokens == 1000
+    assert loop._judge_completion_tokens == 2000
+    assert loop._judge_total_tokens == 3000
+    assert loop._judge_cost_usd == pytest.approx(0.005)
+    assert loop._iter_cost == pytest.approx(0.005)

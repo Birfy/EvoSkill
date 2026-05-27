@@ -102,6 +102,13 @@ class LoopResult:
     best_score: float
     iterations_completed: int
     total_cost_usd: float = 0.0
+    trajectory_cost_usd: float = 0.0
+    preloaded_trajectory_cost_usd: float = 0.0
+    evolution_agent_cost_usd: float = 0.0
+    judge_cost_usd: float = 0.0
+    judge_prompt_tokens: int = 0
+    judge_completion_tokens: int = 0
+    judge_total_tokens: int = 0
 
 
 @dataclass
@@ -259,11 +266,73 @@ class SelfImprovingLoop:
         # Cost tracking
         self._total_cost: float = 0.0
         self._iter_cost: float = 0.0
+        self._trajectory_cost_usd: float = 0.0
+        self._preloaded_trajectory_cost_usd: float = 0.0
+        self._evolution_agent_cost_usd: float = 0.0
+        self._judge_cost_usd: float = 0.0
+        self._judge_prompt_tokens: int = 0
+        self._judge_completion_tokens: int = 0
+        self._judge_total_tokens: int = 0
 
     def _emit(self, event: str, **data: Any) -> None:
         """Fire an event to the display callback if one is registered."""
         if self.on_event is not None:
             self.on_event(event, data)
+
+    def _add_iteration_cost(self, amount: float, bucket: str) -> None:
+        """Track a cost in the current iteration and in a named aggregate bucket."""
+        amount = float(amount or 0.0)
+        if amount <= 0.0:
+            return
+        self._iter_cost = getattr(self, "_iter_cost", 0.0) + amount
+        if bucket == "trajectory":
+            self._trajectory_cost_usd = getattr(self, "_trajectory_cost_usd", 0.0) + amount
+        elif bucket == "evolution":
+            self._evolution_agent_cost_usd = getattr(self, "_evolution_agent_cost_usd", 0.0) + amount
+        elif bucket == "judge":
+            self._judge_cost_usd = getattr(self, "_judge_cost_usd", 0.0) + amount
+
+    def _add_preloaded_trajectory_cost(self, amount: float) -> None:
+        """Track costs already embedded in loaded trajectories."""
+        amount = float(amount or 0.0)
+        if amount <= 0.0:
+            return
+        self._preloaded_trajectory_cost_usd += amount
+        self._trajectory_cost_usd += amount
+        self._total_cost += amount
+
+    def _build_loop_result(
+        self,
+        frontier: list[tuple[str, float]],
+        best_program: str,
+        best_score: float,
+        iterations_completed: int,
+    ) -> LoopResult:
+        return LoopResult(
+            frontier=frontier,
+            best_program=best_program,
+            best_score=best_score,
+            iterations_completed=iterations_completed,
+            total_cost_usd=self._total_cost,
+            trajectory_cost_usd=self._trajectory_cost_usd,
+            preloaded_trajectory_cost_usd=self._preloaded_trajectory_cost_usd,
+            evolution_agent_cost_usd=self._evolution_agent_cost_usd,
+            judge_cost_usd=self._judge_cost_usd,
+            judge_prompt_tokens=self._judge_prompt_tokens,
+            judge_completion_tokens=self._judge_completion_tokens,
+            judge_total_tokens=self._judge_total_tokens,
+        )
+
+    def _format_cost_breakdown(self) -> str:
+        return (
+            f"Total cost: ${self._total_cost:.4f} "
+            f"(trajectory=${self._trajectory_cost_usd:.4f}, "
+            f"preloaded=${self._preloaded_trajectory_cost_usd:.4f}, "
+            f"evolution=${self._evolution_agent_cost_usd:.4f}, "
+            f"judge=${self._judge_cost_usd:.4f}; "
+            f"judge_tokens={self._judge_total_tokens} "
+            f"in={self._judge_prompt_tokens} out={self._judge_completion_tokens})"
+        )
 
     def _save_checkpoint(self, iteration: int) -> None:
         """Save sampling state for exact resume.
@@ -394,7 +463,10 @@ class SelfImprovingLoop:
             traces = await asyncio.gather(*[
                 self.agents.base.run(question) for question, _, _ in test_samples
             ])
-            self._iter_cost += sum(t.total_cost_usd for t in traces)
+            self._add_iteration_cost(
+                sum(t.total_cost_usd for t in traces),
+                "trajectory",
+            )
 
             # Collect failures
             failures: list[tuple[AgentTrace, str, str, str]] = []  # (trace, agent_answer, ground_truth, category)
@@ -499,15 +571,14 @@ class SelfImprovingLoop:
         best_score = frontier[0][1] if frontier else 0.0
 
         _log("DONE", f"{iteration_count} iterations, best: {best or 'base'} ({best_score:.4f})")
-        _log("COST", f"Total cost: ${self._total_cost:.4f}")
+        _log("COST", self._format_cost_breakdown())
         self._emit("loop_done", best=best or "base", best_score=best_score, iterations=iteration_count)
 
-        return LoopResult(
-            frontier=frontier,
-            best_program=best or "base",
-            best_score=best_score,
-            iterations_completed=iteration_count,
-            total_cost_usd=self._total_cost,
+        return self._build_loop_result(
+            frontier,
+            best or "base",
+            best_score,
+            iteration_count,
         )
 
     async def _ensure_base_program(self) -> None:
@@ -531,7 +602,7 @@ class SelfImprovingLoop:
         )
         _log("", f"  -> Base score: {base_score:.4f}")
         _log("", f"  -> Frontier: {self.manager.get_frontier()}")
-        _log("COST", f"Base eval cost: ${self._iter_cost:.4f} | Total: ${self._total_cost:.4f}")
+        _log("COST", f"Base eval cost: ${self._iter_cost:.4f} | {self._format_cost_breakdown()}")
         self._emit("baseline", score=base_score, n_skills=len(self._get_active_skills()))
 
     async def _evaluate(self, data: list[tuple[str, str, str]]) -> float:
@@ -552,7 +623,7 @@ class SelfImprovingLoop:
         score = 0.0
         for result in results:
             if result.trace is not None:
-                self._iter_cost += result.trace.total_cost_usd
+                self._add_iteration_cost(result.trace.total_cost_usd, "trajectory")
             if result.trace is None or result.trace.output is None:
                 continue  # Timeout/error/parse failed = 0 score
             score += self.scorer(
@@ -606,7 +677,7 @@ class SelfImprovingLoop:
 
         if evolution_mode == "skill_only":
             proposer_trace = await self.agents.skill_proposer.run(proposer_query)
-            self._iter_cost += proposer_trace.total_cost_usd
+            self._add_iteration_cost(proposer_trace.total_cost_usd, "evolution")
 
             if proposer_trace.output is None:
                 _log("", f"  [WARN] Skill proposer failed: {proposer_trace.parse_error}")
@@ -657,7 +728,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
             skills_before = set(self._get_active_skills())
             skill_trace = await self.agents.skill_generator.run(skill_query)
-            self._iter_cost += skill_trace.total_cost_usd
+            self._add_iteration_cost(skill_trace.total_cost_usd, "evolution")
             skills_after = set(self._get_active_skills())
             new_skills = skills_after - skills_before
             created_skill = next(iter(new_skills)) if new_skills else None
@@ -682,7 +753,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
         else:  # prompt_only
             proposer_trace = await self.agents.prompt_proposer.run(proposer_query)
-            self._iter_cost += proposer_trace.total_cost_usd
+            self._add_iteration_cost(proposer_trace.total_cost_usd, "evolution")
 
             if proposer_trace.output is None:
                 _log("", f"  [WARN] Prompt proposer failed: {proposer_trace.parse_error}")
@@ -710,7 +781,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 proposer_trace, original_prompt
             )
             prompt_trace = await self.agents.prompt_generator.run(prompt_query)
-            self._iter_cost += prompt_trace.total_cost_usd
+            self._add_iteration_cost(prompt_trace.total_cost_usd, "evolution")
             if prompt_trace.output:
                 update_prompt_file(
                     self._prompt_path, prompt_trace.output.optimized_prompt
@@ -894,7 +965,10 @@ and modify it to add these capabilities. Preserve all existing content that is s
         traces = await asyncio.gather(*[
             self.agents.base.run(q) for q, _, _ in all_data
         ])
-        self._iter_cost += sum(t.total_cost_usd for t in traces)
+        self._add_iteration_cost(
+            sum(t.total_cost_usd for t in traces),
+            "trajectory",
+        )
         result = []
         for trace, (question, ground_truth, category) in zip(traces, all_data):
             agent_answer = (
@@ -1058,6 +1132,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 max_tokens=512,
                 messages=[{"role": "user", "content": prompt}],
             )
+            self._record_judge_api_usage(provider, model, getattr(resp, "usage", None))
             return resp.content[0].text
         if provider == "openai":
             import openai
@@ -1071,8 +1146,59 @@ and modify it to add these capabilities. Preserve all existing content that is s
             else:
                 kwargs["max_tokens"] = 512
             resp = await client.chat.completions.create(**kwargs)
+            self._record_judge_api_usage(provider, model, getattr(resp, "usage", None))
             return resp.choices[0].message.content or ""
         raise ValueError(f"Judge does not support provider: {provider!r}")
+
+    @staticmethod
+    def _usage_value(usage: Any, names: tuple[str, ...]) -> int:
+        if usage is None:
+            return 0
+        for name in names:
+            value = getattr(usage, name, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(name)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    def _record_judge_api_usage(self, provider: str, model: str, usage: Any) -> None:
+        """Record direct judge token usage and estimated cost."""
+        input_tokens = self._usage_value(
+            usage,
+            ("prompt_tokens", "input_tokens", "cache_read_input_tokens"),
+        )
+        output_tokens = self._usage_value(
+            usage,
+            ("completion_tokens", "output_tokens"),
+        )
+        total_tokens = self._usage_value(usage, ("total_tokens",))
+        if total_tokens <= 0:
+            total_tokens = input_tokens + output_tokens
+
+        self._judge_prompt_tokens = getattr(self, "_judge_prompt_tokens", 0) + input_tokens
+        self._judge_completion_tokens = getattr(self, "_judge_completion_tokens", 0) + output_tokens
+        self._judge_total_tokens = getattr(self, "_judge_total_tokens", 0) + total_tokens
+
+        config = getattr(self, "config", None)
+        input_rate = getattr(config, "judge_input_cost_per_1m", None)
+        output_rate = getattr(config, "judge_output_cost_per_1m", None)
+        if input_rate is None or output_rate is None:
+            return
+
+        cost = (input_tokens * float(input_rate) + output_tokens * float(output_rate)) / 1_000_000.0
+        self._add_iteration_cost(cost, "judge")
+        if cost > 0 and self.config.judge_log_details:
+            _log(
+                "COST",
+                (
+                    f"Judge API {provider}/{model}: "
+                    f"in={input_tokens} out={output_tokens} cost=${cost:.6f}"
+                ),
+            )
 
     @staticmethod
     def _clamp01(value: Any, default: float = 0.5) -> float:
@@ -1615,13 +1741,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
         if self._preloaded_trajectories is not None:
             extended_traces = self._preloaded_trajectories
             _log("COLLECT", f"Using {len(extended_traces)} pre-collected trajectories (skipping agent inference)")
+            preloaded_cost = sum(float(trace.total_cost_usd or 0.0) for trace, *_ in extended_traces)
+            self._add_preloaded_trajectory_cost(preloaded_cost)
+            _log("COST", f"Preloaded trajectory cost: ${preloaded_cost:.4f} | {self._format_cost_breakdown()}")
         else:
             all_data = self._get_all_data()
             _log("COLLECT", f"Running all {len(all_data)} samples upfront (no train/val split)...")
             self._iter_cost = 0.0
             extended_traces = await self._collect_all_trajectories(all_data)
             self._total_cost += self._iter_cost
-            _log("COST", f"Trajectory collection: ${self._iter_cost:.4f}")
+            _log("COST", f"Trajectory collection: ${self._iter_cost:.4f} | {self._format_cost_breakdown()}")
 
         # 3. Compute base score and partition failures
         all_failures_ext: list[tuple[AgentTrace, str, str, str, str]] = []
@@ -1961,12 +2090,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
         best = self.manager.get_best_from_frontier()
         best_score = frontier[0][1] if frontier else 0.0
         _log("DONE", f"{iteration_count} iterations, best: {best or 'base'} ({best_score:.4f})")
-        _log("COST", f"Total cost: ${self._total_cost:.4f}")
+        _log("COST", self._format_cost_breakdown())
         self._emit("loop_done", best=best or "base", best_score=best_score, iterations=iteration_count)
-        return LoopResult(
-            frontier=frontier,
-            best_program=best or "base",
-            best_score=best_score,
-            iterations_completed=iteration_count,
-            total_cost_usd=self._total_cost,
+        return self._build_loop_result(
+            frontier,
+            best or "base",
+            best_score,
+            iteration_count,
         )

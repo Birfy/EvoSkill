@@ -352,6 +352,7 @@ Important options:
 | `--children_per_iteration N` | Generates multiple children from the selected PUCT parent in one iteration. |
 | `--puct_children_per_node N` | Caps how many children each tree node can expand. |
 | `--puct_default_prior X` | Fallback PUCT prior when the proposer does not return confidence. |
+| `--judge_input_cost_per_1m X` / `--judge_output_cost_per_1m X` | Optional direct judge pricing in USD per 1M tokens. Without these, judge token usage is tracked but judge cost is reported as `$0.0000`. |
 | `EVOSKILL_NO_GIT=1` | Uses a local filesystem program manager under `.evoskill/local_programs` instead of creating git branches. Useful for dirty worktrees and offline experiments. |
 
 ## Harbor Integration
@@ -473,6 +474,7 @@ The offline path supports:
 - LLM judge scoring from pre-collected failures.
 - Global Bradley-Terry fitting for comparable node ratings.
 - Anchor comparisons against parent, base, current best, and frontier nodes to keep the global rating graph connected.
+- Cost accounting split by trajectory, preloaded trajectory, proposer/generator evolution calls, and direct judge API calls. Direct judge calls always record token usage; dollar cost requires `--judge_input_cost_per_1m` and `--judge_output_cost_per_1m`.
 
 ### `evoskill diff`
 

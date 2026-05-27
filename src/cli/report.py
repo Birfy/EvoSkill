@@ -26,6 +26,13 @@ class RunReport:
     skills_proposed: int
     project_root: Path = field(default_factory=Path.cwd)
     total_cost_usd: float = 0.0
+    trajectory_cost_usd: float = 0.0
+    preloaded_trajectory_cost_usd: float = 0.0
+    evolution_agent_cost_usd: float = 0.0
+    judge_cost_usd: float = 0.0
+    judge_prompt_tokens: int = 0
+    judge_completion_tokens: int = 0
+    judge_total_tokens: int = 0
 
     @property
     def improvement(self) -> float:
@@ -44,7 +51,18 @@ class RunReport:
             f'  ({sign}{self.improvement:.1%})',
             f'  Iterations: {self.iterations_completed}  |  Skills kept: {len(self.skills_kept)} of {self.skills_proposed} proposed',
             f'  Total cost: ${self.total_cost_usd:.4f}',
+            (
+                f'  Cost breakdown: trajectory=${self.trajectory_cost_usd:.4f}, '
+                f'preloaded=${self.preloaded_trajectory_cost_usd:.4f}, '
+                f'evolution=${self.evolution_agent_cost_usd:.4f}, '
+                f'judge=${self.judge_cost_usd:.4f}'
+            ),
         ]
+        if self.judge_total_tokens:
+            lines.append(
+                f'  Judge tokens: {self.judge_total_tokens} '
+                f'(in={self.judge_prompt_tokens}, out={self.judge_completion_tokens})'
+            )
         if self.skills_kept:
             lines.append('  Skills (by accuracy impact):')
             for i, sk in enumerate(sorted(self.skills_kept, key=lambda s: s.score_delta, reverse=True), 1):
@@ -79,6 +97,11 @@ class RunReport:
             f'| Skills kept | {len(self.skills_kept)} of {self.skills_proposed} proposed |',
             f'| Best program | `{self.best_program}` |',
             f'| Total cost | ${self.total_cost_usd:.4f} |',
+            f'| Trajectory cost | ${self.trajectory_cost_usd:.4f} |',
+            f'| Preloaded trajectory cost | ${self.preloaded_trajectory_cost_usd:.4f} |',
+            f'| Evolution agent cost | ${self.evolution_agent_cost_usd:.4f} |',
+            f'| Judge cost | ${self.judge_cost_usd:.4f} |',
+            f'| Judge tokens | {self.judge_total_tokens} (in={self.judge_prompt_tokens}, out={self.judge_completion_tokens}) |',
             '',
             '## Iteration Log',
             '',

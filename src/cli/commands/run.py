@@ -524,6 +524,13 @@ def run_cmd(continue_loop: bool, verbose: bool, quiet: bool, config_path: Path |
         skills_proposed=display.skills_proposed,
         project_root=cfg.project_root,
         total_cost_usd=result.total_cost_usd,
+        trajectory_cost_usd=result.trajectory_cost_usd,
+        preloaded_trajectory_cost_usd=result.preloaded_trajectory_cost_usd,
+        evolution_agent_cost_usd=result.evolution_agent_cost_usd,
+        judge_cost_usd=result.judge_cost_usd,
+        judge_prompt_tokens=result.judge_prompt_tokens,
+        judge_completion_tokens=result.judge_completion_tokens,
+        judge_total_tokens=result.judge_total_tokens,
     )
     report.print_summary()
 

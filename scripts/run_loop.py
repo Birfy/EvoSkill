@@ -328,6 +328,20 @@ class LoopSettings(BaseSettings):
         default=True,
         description="Print per-sample judge JSON, match scores, and Elo updates.",
     )
+    judge_input_cost_per_1m: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional direct judge input-token price in USD per 1M tokens. "
+            "When omitted, judge token usage is tracked but judge cost is $0."
+        ),
+    )
+    judge_output_cost_per_1m: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional direct judge output-token price in USD per 1M tokens. "
+            "When omitted, judge token usage is tracked but judge cost is $0."
+        ),
+    )
     puct_c: float = Field(
         default=0.5,
         description="PUCT exploration constant for LLM-judge run-loop tree search.",
@@ -534,6 +548,8 @@ async def main(settings: LoopSettings):
         judge_elo_k=settings.judge_elo_k,
         judge_elo_scale=settings.judge_elo_scale,
         judge_log_details=settings.judge_log_details,
+        judge_input_cost_per_1m=settings.judge_input_cost_per_1m,
+        judge_output_cost_per_1m=settings.judge_output_cost_per_1m,
         puct_c=settings.puct_c,
         puct_max_depth=settings.puct_max_depth,
         puct_children_per_node=settings.puct_children_per_node,
@@ -556,6 +572,16 @@ async def main(settings: LoopSettings):
 
     print(f"Best: {result.best_program} ({result.best_score:.2%})")
     print(f"Frontier: {result.frontier}")
+    print(
+        "Cost: "
+        f"total=${result.total_cost_usd:.4f}, "
+        f"trajectory=${result.trajectory_cost_usd:.4f}, "
+        f"preloaded=${result.preloaded_trajectory_cost_usd:.4f}, "
+        f"evolution=${result.evolution_agent_cost_usd:.4f}, "
+        f"judge=${result.judge_cost_usd:.4f}, "
+        f"judge_tokens={result.judge_total_tokens} "
+        f"(in={result.judge_prompt_tokens}, out={result.judge_completion_tokens})"
+    )
     return result
 
 
