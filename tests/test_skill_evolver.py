@@ -55,12 +55,9 @@ trigger_conditions:
 
 
 def test_evaluator_static_quality_scores_skill_content(tmp_path):
-    from src.evaluation.evaluator import SkillLearnBenchEvaluator
+    from src.evaluation.evaluator import OfflineSkillEvaluator
 
-    bench = tmp_path / "bench"
-    bench.mkdir()
-    (bench / "tasks.json").write_text("[]")
-    evaluator = SkillLearnBenchEvaluator(bench)
+    evaluator = OfflineSkillEvaluator()
 
     content = """---
 name: numeric
@@ -81,3 +78,42 @@ Output: value
     score = evaluator.evaluate_skill_quality(content, {"domain": "office finance"})
 
     assert score == 1.0
+
+
+def test_evaluator_can_use_trajectory_records_without_benchmark_file(tmp_path):
+    from src.evaluation.evaluator import OfflineSkillEvaluator
+
+    skills = tmp_path / "skills" / "numeric"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("""---
+name: numeric
+trigger_conditions:
+  - "numeric task"
+---
+
+## Procedure
+1. Extract the value.
+
+## Examples
+Input: value request
+Output: value
+
+## Failure Patterns
+- Missing value.
+""")
+    trajectories = tmp_path / "trajectories.jsonl"
+    trajectories.write_text(json.dumps({
+        "task_id": "task-1",
+        "domain": "numbers",
+        "skills_used": ["numeric"],
+        "final_success": True,
+        "steps": [],
+    }) + "\n")
+
+    result = OfflineSkillEvaluator().run_full_evaluation(
+        skill_library_path=tmp_path / "skills",
+        trajectory_path=trajectories,
+    )
+
+    assert result["n_tasks"] == 1
+    assert result["task_success_rate"] == 1.0

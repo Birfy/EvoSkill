@@ -1,4 +1,4 @@
-"""CLI entry point for SkillLearnBench-style evaluation."""
+"""CLI entry point for generic offline skill evaluation."""
 
 from __future__ import annotations
 
@@ -6,12 +6,26 @@ import argparse
 import json
 from pathlib import Path
 
-from src.evaluation.evaluator import SkillLearnBenchEvaluator
+from src.evaluation.evaluator import OfflineSkillEvaluator
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run three-layer skill evaluation")
-    parser.add_argument("--benchmark", required=True, help="Benchmark directory with tasks.json")
+    parser.add_argument(
+        "--tasks",
+        default=None,
+        help="Task JSON/JSONL file, or a directory containing tasks.json. Optional if trajectories contain task ids.",
+    )
+    parser.add_argument(
+        "--keypoints-dir",
+        default=None,
+        help="Optional directory of <task_id>.json files with required_actions for static outcome checks.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        default=None,
+        help="Deprecated compatibility shortcut for a directory with tasks.json and eval_keypoints/.",
+    )
     parser.add_argument(
         "--condition",
         action="append",
@@ -22,7 +36,18 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Output summary JSON path")
     args = parser.parse_args()
 
-    evaluator = SkillLearnBenchEvaluator(args.benchmark, model=args.model)
+    tasks = args.tasks
+    keypoints_dir = args.keypoints_dir
+    if args.benchmark:
+        benchmark = Path(args.benchmark)
+        tasks = tasks or str(benchmark / "tasks.json")
+        keypoints_dir = keypoints_dir or str(benchmark / "eval_keypoints")
+
+    evaluator = OfflineSkillEvaluator(
+        tasks_path=tasks,
+        model=args.model,
+        keypoints_dir=keypoints_dir,
+    )
     summaries = []
     for raw in args.condition:
         name, trajectory_path, skills_dir = raw.split(":", 2)

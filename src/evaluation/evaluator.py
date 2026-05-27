@@ -1,4 +1,4 @@
-"""Three-layer SkillLearnBench-style evaluator."""
+"""Generic three-layer evaluator for offline skill experiments."""
 
 from __future__ import annotations
 
@@ -21,9 +21,25 @@ class SkillEvalResult:
     notes: str = ""
 
 
-class SkillLearnBenchEvaluator:
-    def __init__(self, benchmark_path: str | Path, model: str = "claude-sonnet-4-6"):
-        self.bench_path = Path(benchmark_path)
+class OfflineSkillEvaluator:
+    """Evaluate skill quality, trajectory alignment, and task outcome.
+
+    The evaluator is benchmark-agnostic. It accepts any task file containing
+    records with at least an ``id`` field, plus trajectory JSONL records keyed
+    by ``task_id``. If a keypoints directory is supplied, task outcome can be
+    checked against static required actions; otherwise it falls back to the
+    trajectory's own ``final_success`` flag.
+    """
+
+    def __init__(
+        self,
+        tasks_path: str | Path | None = None,
+        model: str = "claude-sonnet-4-6",
+        *,
+        keypoints_dir: str | Path | None = None,
+    ):
+        self.tasks_path = Path(tasks_path) if tasks_path is not None else None
+        self.keypoints_dir = Path(keypoints_dir) if keypoints_dir is not None else None
         self.model = model
 
     def evaluate_skill_quality(self, skill_content: str, task: dict[str, Any]) -> float:
@@ -62,7 +78,10 @@ Respond ONLY with JSON: {{"score": <float>, "reason": "<brief>"}}"""
             return 0.0
 
     def evaluate_task_outcome(self, task: dict[str, Any], trajectory: dict[str, Any]) -> bool:
-        keypoints_path = self.bench_path / "eval_keypoints" / f"{task['id']}.json"
+        if self.keypoints_dir is None:
+            return bool(trajectory.get("final_success", False))
+
+        keypoints_path = self.keypoints_dir / f"{task['id']}.json"
         if not keypoints_path.exists():
             return bool(trajectory.get("final_success", False))
 
@@ -81,9 +100,10 @@ Respond ONLY with JSON: {{"score": <float>, "reason": "<brief>"}}"""
         skill_library_path: str | Path,
         trajectory_path: str | Path,
         condition_name: str = "ours",
+        tasks_path: str | Path | None = None,
     ) -> dict[str, Any]:
         trajectories = self._load_trajectories(trajectory_path)
-        tasks = json.loads((self.bench_path / "tasks.json").read_text())
+        tasks = self._load_tasks(tasks_path or self.tasks_path, trajectories)
         skill_lib = Path(skill_library_path)
 
         results: list[SkillEvalResult] = []
@@ -128,6 +148,48 @@ Respond ONLY with JSON: {{"score": <float>, "reason": "<brief>"}}"""
                 trajectories[task_id] = traj
         return trajectories
 
+    def _load_tasks(
+        self,
+        path: str | Path | None,
+        trajectories: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if path is None:
+            return [
+                {
+                    "id": task_id,
+                    "domain": traj.get("domain") or traj.get("category") or "unknown",
+                }
+                for task_id, traj in trajectories.items()
+            ]
+
+        path = Path(path)
+        if path.is_dir():
+            path = path / "tasks.json"
+        if path.suffix == ".jsonl":
+            tasks = []
+            with open(path) as f:
+                for idx, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    task = json.loads(line)
+                    task.setdefault("id", str(idx))
+                    tasks.append(task)
+            return tasks
+
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            data = data.get("tasks", list(data.values()))
+        if not isinstance(data, list):
+            raise ValueError(f"Task file must contain a list or JSONL records: {path}")
+        tasks = []
+        for idx, task in enumerate(data):
+            if not isinstance(task, dict):
+                continue
+            task.setdefault("id", str(idx))
+            tasks.append(task)
+        return tasks
+
     def _skill_content_for(self, skill_lib: Path, trajectory: dict[str, Any]) -> str:
         parts: list[str] = []
         for skill_name in trajectory.get("skills_used") or []:
@@ -171,3 +233,15 @@ def _clamp_float(value: object, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return max(0.0, min(1.0, number))
+
+
+class SkillLearnBenchEvaluator(OfflineSkillEvaluator):
+    """Backward-compatible wrapper for the old benchmark-specific name."""
+
+    def __init__(self, benchmark_path: str | Path, model: str = "claude-sonnet-4-6"):
+        benchmark_path = Path(benchmark_path)
+        super().__init__(
+            tasks_path=benchmark_path / "tasks.json",
+            model=model,
+            keypoints_dir=benchmark_path / "eval_keypoints",
+        )
