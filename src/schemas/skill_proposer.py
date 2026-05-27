@@ -22,6 +22,9 @@ class SkillProposerResponse(BaseModel):
     justification: str
     """Explanation of why this skill/modification addresses the identified gap."""
 
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Proposer confidence that this change addresses the observed failures."""
+
     related_iterations: list[str] = Field(default_factory=list)
     """List of relevant past iterations referenced in the proposal (e.g., ["iter-4", "iter-9"])."""
 

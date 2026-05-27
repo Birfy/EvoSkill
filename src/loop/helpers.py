@@ -243,6 +243,93 @@ def build_skill_query_from_skill_proposer(
 Justification: {proposer_trace.output.justification}"""
 
 
+def build_judge_query(
+    trace_summary: str,
+    question: str,
+    agent_answer: str,
+    ground_truth: str,
+    skills_content: str,
+    proposal: str = "",
+    justification: str = "",
+    parent_skill_summary: str = "",
+    candidate_skill_summary: str = "",
+    skill_diff: str = "",
+) -> str:
+    """Build the prompt for the LLM judge.
+
+    The judge sees the failed trajectory, the expected answer, and all current
+    skills, then predicts what the agent would do differently and whether the
+    new action would succeed.
+
+    Returns:
+        A prompt string for the judge LLM.
+    """
+    parent_section = parent_skill_summary or "[not provided]"
+    candidate_section = candidate_skill_summary or "[not provided]"
+    diff_section = skill_diff or "[not provided]"
+
+    return f"""You are evaluating whether newly added/modified skills would help an AI agent solve a task it previously failed.
+
+Treat this as a pairwise match:
+- Baseline player: the original agent behavior shown in the failed trajectory.
+- Challenger player: the same agent with the skills listed below available.
+
+This is an offline skill-evolution estimate, not a strict acceptance test. Score
+partial improvements when the skill addresses the root cause but may not fully
+guarantee the exact answer. Use probabilities instead of only a hard yes/no.
+Do not require certainty. Estimate the probability of success under the
+challenger skills compared with the parent skills.
+
+## Original Question
+{question}
+
+## Expected Answer
+{ground_truth}
+
+## Agent's Failed Attempt (trajectory summary)
+{trace_summary}
+
+## Agent's Wrong Answer
+{agent_answer}
+
+## Parent Skill Summary
+{parent_section}
+
+## Candidate Skill Summary
+{candidate_section}
+
+## Proposal / Intended Change
+{proposal or "[not provided]"}
+
+## Proposal Justification
+{justification or "[not provided]"}
+
+## Skill Diff / Concrete Change
+{diff_section}
+
+## Candidate Skills Now Available to the Agent
+{skills_content}
+
+## Your Task
+1. Identify the key step where the agent went wrong.
+2. Compare parent skill guidance against candidate skill guidance.
+3. Decide whether the candidate change addresses the root cause better than the parent.
+4. Predict what the agent would do differently at that step given the candidate skills.
+5. Estimate the probability that this changed behavior would reach the expected answer.
+
+Respond ONLY with a JSON object (no markdown fences):
+{{
+  "root_cause": "<brief description of the original failure cause>",
+  "hypothetical_action": "<brief description of what the agent would do differently>",
+  "skill_addresses_root_cause": <0.0 to 1.0, how directly the skill addresses the failure cause>,
+  "probability_of_success": <0.0 to 1.0, probability the challenger reaches the expected answer>,
+  "would_succeed": <true or false>,
+  "confidence": <0.0 to 1.0, confidence in your probability estimate>,
+  "remaining_blockers": ["<short blocker>", "..."],
+  "reasoning": "<one or two sentences>"
+}}"""
+
+
 def build_prompt_query_from_prompt_proposer(
     proposer_trace: "AgentTrace[PromptProposerResponse]",
     original_prompt: str,

@@ -1,8 +1,10 @@
 """Self-improving agent loop runner."""
 
 import asyncio
+import difflib
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Generic, TypeVar
 
@@ -68,6 +70,7 @@ from .helpers import (
     build_prompt_query,
     build_skill_query_from_skill_proposer,
     build_prompt_query_from_prompt_proposer,
+    build_judge_query,
     append_feedback,
     read_feedback_history,
     update_prompt_file,
@@ -101,6 +104,74 @@ class LoopResult:
     total_cost_usd: float = 0.0
 
 
+@dataclass
+class JudgeMatchResult:
+    """One LLM-judged pairwise match used by Elo scoring."""
+
+    index: int
+    category: str
+    would_succeed: bool
+    confidence: float
+    match_score: float
+    expected_before: float
+    child_rating_after: float
+    opponent_rating_after: float
+    hypothetical_action: str
+    reasoning: str
+    raw_response: str
+    valid: bool = True
+    root_cause: str = ""
+    skill_addresses_root_cause: float = 0.0
+    probability_of_success: float = 0.0
+    remaining_blockers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class JudgeResult:
+    """Aggregated LLM judge result."""
+
+    estimated_fix_rate: float
+    average_match_score: float
+    child_rating: float
+    opponent_rating: float
+    expected_win_rate: float
+    matches: list[JudgeMatchResult]
+
+
+@dataclass(frozen=True)
+class BradleyTerryMatch:
+    """One soft pairwise comparison for the global Bradley-Terry league."""
+
+    player: str
+    opponent: str
+    score: float
+    category: str = ""
+    index: int = 0
+
+
+@dataclass
+class ProgramSearchNode:
+    """PUCT node for run-loop program evolution."""
+
+    name: str
+    parent: "ProgramSearchNode | None"
+    prior: float = 0.5
+    score: float = 0.0
+    visit_count: int = 0
+    total_q: float = 0.0
+    depth: int = 0
+    discarded: bool = False
+    children: list["ProgramSearchNode"] = field(default_factory=list)
+
+    @property
+    def q_value(self) -> float:
+        return self.total_q / self.visit_count if self.visit_count else self.score
+
+    def puct_score(self, c_puct: float, parent_visits: int) -> float:
+        exploration = c_puct * self.prior * math.sqrt(max(parent_visits, 1)) / (1 + self.visit_count)
+        return self.q_value + exploration
+
+
 class SelfImprovingLoop:
     """Self-improving agent loop with git-based versioning.
 
@@ -122,6 +193,7 @@ class SelfImprovingLoop:
         scorer: Callable[[str, str, str], float] | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         task_constraints: str = "",
+        preloaded_trajectories: list[tuple[Any, str, str, str, str]] | None = None,
     ):
         """Initialize the self-improving loop.
 
@@ -130,9 +202,16 @@ class SelfImprovingLoop:
             agents: Container with the 4 agents (base, proposer, skill_generator, prompt_generator).
             manager: ProgramManager for git-based versioning.
             train_pools: Dict mapping category -> list of (question, answer) tuples.
+                Used for category-aware sampling in the evolution loop.
+                Pass an empty dict when supplying preloaded_trajectories.
             val_data: Validation data as list of (question, answer, category) tuples.
+                Unused in LLM judge mode when preloaded_trajectories is provided.
             scorer: Scoring function (question, predicted, ground_truth) -> float.
                     Defaults to _score_multi_tolerance for backward compatibility.
+            preloaded_trajectories: Pre-collected trajectories as a list of
+                (AgentTrace, question, agent_answer, ground_truth, category) tuples.
+                When provided and use_llm_judge=True, the loop skips agent inference
+                entirely and uses these trajectories directly for skill evolution.
         """
         self.config = config
         self.agents = agents
@@ -142,10 +221,15 @@ class SelfImprovingLoop:
         self.scorer = scorer or _score_multi_tolerance
         self.on_event = on_event
         self.task_constraints = task_constraints
+        self._preloaded_trajectories = preloaded_trajectories
 
-        # Round-robin sampling state
-        self._category_offset = 0  # Which category to start with next iteration
-        self._per_cat_offset: dict[str, int] = {cat: 0 for cat in train_pools.keys()}
+        # Round-robin sampling state — seeded from preloaded categories if available
+        self._category_offset = 0
+        if preloaded_trajectories:
+            cats = sorted({entry[4] for entry in preloaded_trajectories})
+            self._per_cat_offset: dict[str, int] = {cat: 0 for cat in cats}
+        else:
+            self._per_cat_offset = {cat: 0 for cat in train_pools.keys()}
 
         # Paths
         self._project_root = Path(getattr(self.manager, "cwd", Path.cwd())).resolve()
@@ -223,6 +307,9 @@ class SelfImprovingLoop:
         Returns:
             LoopResult with frontier, best program, and iteration count.
         """
+        if self.config.use_llm_judge:
+            return await self._run_with_llm_judge()
+
         # 0. Handle continue mode and feedback reset
         resume_iteration: int | None = None
         if not self.config.continue_mode:
@@ -232,6 +319,10 @@ class SelfImprovingLoop:
             self._iteration_offset = 0
             # Delete any existing checkpoint on fresh start
             self._delete_checkpoint()
+            reset_manager = getattr(self.manager, "reset", None)
+            if callable(reset_manager):
+                reset_manager()
+                _log("INIT", "Reset local program state for fresh run")
         else:
             # Continue mode: keep feedback, find highest iteration number
             self._iteration_offset = self._get_highest_iteration()
@@ -342,7 +433,7 @@ class SelfImprovingLoop:
             if mutation_result is None:
                 no_improvement_count += 1
             else:
-                child_name, proposal, justification = mutation_result
+                child_name, proposal, justification, _proposer_confidence = mutation_result
 
                 # Evaluate child
                 _log("", f"  -> Evaluating {child_name}...")
@@ -475,9 +566,9 @@ class SelfImprovingLoop:
         self,
         parent: str,
         failures: list[tuple[AgentTrace[AgentResponse], str, str, str]],
-        iteration: int,
+        iteration: int | str,
         truncation_level: int = 0,
-    ) -> tuple[str, str, str] | None:
+    ) -> tuple[str, str, str, float] | None:
         """Run proposer and generator to create a mutation based on multiple failures.
 
         Args:
@@ -487,10 +578,15 @@ class SelfImprovingLoop:
             truncation_level: Context reduction level (0=full, 1=moderate, 2=aggressive).
 
         Returns:
-            Tuple of (child_name, proposal, justification) if created, None otherwise.
+            Tuple of (child_name, proposal, justification, proposer_confidence)
+            if created, None otherwise.
         """
         # Calculate actual iteration number (with offset for continue mode)
-        actual_iteration = iteration + self._iteration_offset
+        actual_iteration = (
+            iteration + self._iteration_offset
+            if isinstance(iteration, int)
+            else iteration
+        )
 
         # Run appropriate proposer based on evolution mode
         evolution_mode = self.config.evolution_mode
@@ -509,11 +605,21 @@ class SelfImprovingLoop:
             proposer_output = proposer_trace.output
             proposed = proposer_output.proposed_skill
             justification = proposer_output.justification
+            proposer_confidence = self._clamp01(
+                getattr(proposer_output, "confidence", None),
+                default=self.config.puct_default_prior,
+            )
             action_type = proposer_output.action
             target_skill = proposer_output.target_skill
 
             action_label = f"edit:{target_skill}" if action_type == "edit" else "create"
-            _log("", f"  -> Proposal: skill ({action_label}) - {proposed[:50]}...")
+            _log(
+                "",
+                (
+                    f"  -> Proposal: skill ({action_label}, prior={proposer_confidence:.3f}) "
+                    f"- {proposed[:50]}..."
+                ),
+            )
             self._emit("proposal", action=action_type, target_skill=target_skill, summary=proposed[:80])
 
             # Create child program branch
@@ -574,7 +680,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
             proposed = proposer_trace.output.proposed_prompt_change
             justification = proposer_trace.output.justification
-            _log("", f"  -> Proposal: prompt - {proposed[:50]}...")
+            proposer_confidence = self._clamp01(
+                getattr(proposer_trace.output, "confidence", None),
+                default=self.config.puct_default_prior,
+            )
+            _log("", f"  -> Proposal: prompt (prior={proposer_confidence:.3f}) - {proposed[:50]}...")
 
             # Create child program branch
             child_name = f"iter-prompt-{actual_iteration}"
@@ -600,14 +710,14 @@ and modify it to add these capabilities. Preserve all existing content that is s
         self.manager.commit(f"{child_name}: {proposed[:50]}")
 
         # Return mutation info (feedback will be written by caller with outcome)
-        return (child_name, proposed, justification)
+        return (child_name, proposed, justification, proposer_confidence)
 
     async def _mutate_with_fallback(
         self,
         parent: str,
         failures: list[tuple[AgentTrace[AgentResponse], str, str, str]],
-        iteration: int,
-    ) -> tuple[str, str, str] | None:
+        iteration: int | str,
+    ) -> tuple[str, str, str, float] | None:
         """Try progressive truncation levels, then single-failure fallback.
 
         Args:
@@ -616,7 +726,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
             iteration: Current iteration number.
 
         Returns:
-            Tuple of (child_name, proposal, justification) if created, None otherwise.
+            Tuple of (child_name, proposal, justification, proposer_confidence)
+            if created, None otherwise.
         """
         max_level = self.config.proposer_max_truncation_level
 
@@ -709,3 +820,1078 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 except ValueError:
                     pass
         return max_iter
+
+    # ------------------------------------------------------------------ #
+    # LLM Judge mode helpers                                               #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def load_trajectories_from_dir(
+        trajectories_dir: str | Path,
+    ) -> list[tuple[Any, str, str, str, str]]:
+        """Load pre-collected trajectories from a directory produced by collect_trajectories.py.
+
+        Args:
+            trajectories_dir: Directory containing ``trajectories.jsonl``.
+
+        Returns:
+            List of (AgentTrace, question, agent_answer, ground_truth, category) tuples
+            ready to pass as ``preloaded_trajectories`` to SelfImprovingLoop.__init__.
+        """
+        from src.schemas.trajectory import StoredTrajectory
+        jsonl_path = Path(trajectories_dir) / "trajectories.jsonl"
+        if not jsonl_path.exists():
+            raise FileNotFoundError(f"Trajectories file not found: {jsonl_path}")
+        stored = StoredTrajectory.load_jsonl(jsonl_path)
+        return [t.to_extended_tuple() for t in stored]
+
+    def _get_all_data(self) -> list[tuple[str, str, str]]:
+        """Combine train pools and val data into one flat, deduplicated list."""
+        seen: set[tuple[str, str, str]] = set()
+        result: list[tuple[str, str, str]] = []
+        for cat, pool in self.train_pools.items():
+            for q, a in pool:
+                key = (q, a, cat)
+                if key not in seen:
+                    seen.add(key)
+                    result.append(key)
+        for q, a, cat in self.val_data:
+            key = (q, a, cat)
+            if key not in seen:
+                seen.add(key)
+                result.append(key)
+        return result
+
+    async def _collect_all_trajectories(
+        self,
+        all_data: list[tuple[str, str, str]],
+    ) -> list[tuple[AgentTrace, str, str, str, str]]:
+        """Run all samples concurrently and return (trace, question, agent_answer, ground_truth, category)."""
+        traces = await asyncio.gather(*[
+            self.agents.base.run(q) for q, _, _ in all_data
+        ])
+        self._iter_cost += sum(t.total_cost_usd for t in traces)
+        result = []
+        for trace, (question, ground_truth, category) in zip(traces, all_data):
+            agent_answer = (
+                trace.output.final_answer
+                if trace.output and trace.output.final_answer
+                else "[PARSE FAILED]"
+            )
+            result.append((trace, question, agent_answer, ground_truth, category))
+        return result
+
+    def _get_all_skills_content(self) -> str:
+        """Read and concatenate all active SKILL.md files."""
+        skills_dir = self._project_root / ".claude" / "skills"
+        if not skills_dir.exists():
+            return "No skills available."
+        parts = []
+        for skill_dir in sorted(skills_dir.iterdir()):
+            skill_file = skill_dir / "SKILL.md"
+            if skill_dir.is_dir() and skill_file.exists():
+                parts.append(f"### Skill: {skill_dir.name}\n{skill_file.read_text()}")
+        return "\n\n".join(parts) if parts else "No skills available."
+
+    @staticmethod
+    def _summarize_skill_content(content: str, max_chars: int = 3500) -> str:
+        """Build a compact judge-facing summary of available skills."""
+        if not content.strip():
+            return "No skills available."
+
+        lines: list[str] = []
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("### Skill:") or line.startswith("#") or line.startswith("- "):
+                lines.append(line)
+            if sum(len(item) + 1 for item in lines) >= max_chars:
+                break
+
+        summary = "\n".join(lines) if lines else content.strip()
+        if len(summary) > max_chars:
+            return summary[:max_chars].rstrip() + "\n[truncated]"
+        return summary
+
+    @staticmethod
+    def _diff_skill_content(parent_content: str, candidate_content: str, max_chars: int = 5000) -> str:
+        """Return a bounded unified diff for judge context."""
+        diff = "\n".join(
+            difflib.unified_diff(
+                parent_content.splitlines(),
+                candidate_content.splitlines(),
+                fromfile="parent_skills",
+                tofile="candidate_skills",
+                lineterm="",
+            )
+        )
+        if not diff.strip():
+            return "No textual skill diff detected."
+        if len(diff) > max_chars:
+            return diff[:max_chars].rstrip() + "\n[diff truncated]"
+        return diff
+
+    def _detect_judge_provider_and_model(self) -> tuple[str, str]:
+        """Return (provider, model) for judge calls based on the active SDK."""
+        from src.harness.sdk_config import get_sdk
+        sdk = get_sdk()
+        if sdk == "claude":
+            return "anthropic", self.config.judge_model or "claude-haiku-4-5-20251001"
+        if self.config.judge_model:
+            judge_model = self.config.judge_model
+            if judge_model.startswith("openai/"):
+                return "openai", judge_model.split("/", 1)[1]
+            if judge_model.startswith(("gpt-", "o", "chatgpt-")):
+                return "openai", judge_model
+            if judge_model.startswith("anthropic/"):
+                return "anthropic", judge_model.split("/", 1)[1]
+            if judge_model.startswith("claude"):
+                return "anthropic", judge_model
+        # For opencode / codex / openhands / goose, read provider from base agent options
+        opts = self.agents.base._get_options()
+        if isinstance(opts, dict):
+            model_id = str(opts.get("model_id") or opts.get("model") or "")
+        else:
+            model_id = str(
+                getattr(opts, "model_id", None)
+                or getattr(opts, "model", None)
+                or getattr(opts, "model_name", None)
+                or ""
+            )
+        provider = model_id.split("/")[0] if "/" in model_id else "anthropic"
+        model_name = model_id.split("/", 1)[1] if "/" in model_id else model_id
+        if provider == "openai" or model_name.startswith(("gpt-", "o", "chatgpt-")):
+            return "openai", self.config.judge_model or "gpt-4o-mini"
+        else:
+            return "anthropic", self.config.judge_model or "claude-haiku-4-5-20251001"
+
+    async def _call_judge_api(self, prompt: str, provider: str, model: str) -> str:
+        """Make a direct (non-agent) completion call to the judge model."""
+        from src.harness.provider_auth import ensure_provider_api_key
+        api_key = ensure_provider_api_key(provider)
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.AsyncAnthropic(api_key=api_key)
+            resp = await client.messages.create(
+                model=model,
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text
+        if provider == "openai":
+            import openai
+            client = openai.AsyncOpenAI(api_key=api_key)
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if model.startswith(("gpt-5", "o1", "o3", "o4")):
+                kwargs["max_completion_tokens"] = 512
+            else:
+                kwargs["max_tokens"] = 512
+            resp = await client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+        raise ValueError(f"Judge does not support provider: {provider!r}")
+
+    @staticmethod
+    def _clamp01(value: Any, default: float = 0.5) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = default
+        return max(0.0, min(1.0, numeric))
+
+    @staticmethod
+    def _elo_expected(rating: float, opponent_rating: float, scale: float) -> float:
+        return 1.0 / (1.0 + 10.0 ** ((opponent_rating - rating) / scale))
+
+    @staticmethod
+    def _fit_bradley_terry_ratings(
+        matches: list[BradleyTerryMatch],
+        players: list[str],
+        *,
+        anchor: str = "base",
+        initial_rating: float = 1500.0,
+        scale: float = 400.0,
+        iterations: int = 300,
+        learning_rate: float = 0.08,
+        l2: float = 0.01,
+    ) -> dict[str, float]:
+        """Fit global Bradley-Terry ratings from soft pairwise outcomes.
+
+        The fitted parameter is a logit strength anchored at ``anchor``. It is
+        converted back to Elo-like ratings with ``scale / ln(10)`` so existing
+        Elo expected-win math can be reused.
+        """
+        names = sorted(set(players) | {m.player for m in matches} | {m.opponent for m in matches})
+        if anchor not in names:
+            names.append(anchor)
+        theta = {name: 0.0 for name in names}
+
+        if not matches:
+            return {name: initial_rating for name in names}
+
+        for _ in range(iterations):
+            grad = {name: 0.0 for name in names}
+            for match in matches:
+                if match.player == match.opponent:
+                    continue
+                a = match.player
+                b = match.opponent
+                y = SelfImprovingLoop._clamp01(match.score, default=0.5)
+                diff = theta[a] - theta[b]
+                # Stable sigmoid.
+                if diff >= 0:
+                    exp_neg = math.exp(-diff)
+                    p = 1.0 / (1.0 + exp_neg)
+                else:
+                    exp_pos = math.exp(diff)
+                    p = exp_pos / (1.0 + exp_pos)
+                residual = y - p
+                grad[a] += residual
+                grad[b] -= residual
+
+            for name in names:
+                if name == anchor:
+                    continue
+                grad[name] -= l2 * theta[name]
+                theta[name] += learning_rate * grad[name] / max(1, len(matches))
+
+            # Keep the rating frame stable and globally comparable.
+            offset = theta.get(anchor, 0.0)
+            for name in names:
+                theta[name] -= offset
+            theta[anchor] = 0.0
+
+        factor = scale / math.log(10.0)
+        return {name: initial_rating + theta[name] * factor for name in names}
+
+    @staticmethod
+    def _rating_to_score(
+        rating: float,
+        anchor_rating: float,
+        base_score: float,
+        scale: float,
+    ) -> float:
+        """Map a global rating advantage over base to the score space."""
+        expected_win_rate = SelfImprovingLoop._elo_expected(rating, anchor_rating, scale)
+        fix_rate = max(0.0, min(1.0, 2.0 * (expected_win_rate - 0.5)))
+        return base_score + fix_rate * (1.0 - base_score)
+
+    @staticmethod
+    def _judge_binary_to_match_score(would_succeed: bool, confidence: float) -> float:
+        """Convert judge binary outcome + confidence to an Elo match score.
+
+        Confidence controls distance from a draw:
+        - true, 1.0  -> 1.0 challenger win
+        - false, 1.0 -> 0.0 challenger loss
+        - any, 0.0   -> 0.5 draw/uncertain
+        """
+        if would_succeed:
+            return 0.5 + 0.5 * confidence
+        return 0.5 - 0.5 * confidence
+
+    @staticmethod
+    def _judge_probability_to_match_score(
+        probability_of_success: Any,
+        skill_addresses_root_cause: Any,
+    ) -> float:
+        """Convert probabilistic judge estimates to an Elo match score."""
+        p_success = SelfImprovingLoop._clamp01(probability_of_success, default=0.5)
+        p_root = SelfImprovingLoop._clamp01(skill_addresses_root_cause, default=p_success)
+        return max(0.0, min(1.0, 0.75 * p_success + 0.25 * p_root))
+
+    def _proposal_policy_prior(self, proposer_confidence: float | None = None) -> float:
+        """Return a judge-independent policy prior for PUCT expansion.
+
+        Keep this separate from judge value to avoid double-counting judge
+        scores in both Q and exploration.
+        """
+        if proposer_confidence is None:
+            proposer_confidence = self.config.puct_default_prior
+        return self._clamp01(proposer_confidence, default=self.config.puct_default_prior)
+
+    def _build_program_search_tree(self, base_score: float) -> ProgramSearchNode:
+        """Build an in-memory PUCT tree seeded from the current frontier."""
+        root = ProgramSearchNode(
+            name="base",
+            parent=None,
+            prior=max(0.05, base_score),
+            score=base_score,
+            visit_count=1,
+            total_q=base_score,
+            depth=0,
+        )
+
+        for name, score in self.manager.get_frontier_with_scores():
+            if name == "base":
+                continue
+            child = ProgramSearchNode(
+                name=name,
+                parent=root,
+                prior=self._proposal_policy_prior(),
+                score=score,
+                visit_count=1,
+                total_q=score,
+                depth=1,
+            )
+            root.children.append(child)
+            root.visit_count += 1
+            root.total_q += score
+        return root
+
+    def _select_puct_node(self, root: ProgramSearchNode) -> ProgramSearchNode:
+        """Select a program node to expand using PUCT.
+
+        A node may be expanded until it reaches ``puct_children_per_node``.
+        Once saturated, tree policy descends through the child with the highest
+        PUCT score. If that path reaches max depth, choose the best remaining
+        expandable node anywhere in the tree.
+        """
+        node = root
+        while True:
+            if (
+                node.depth < self.config.puct_max_depth
+                and len(node.children) < self.config.puct_children_per_node
+            ):
+                return node
+
+            live_children = [child for child in node.children if not child.discarded]
+            if not live_children:
+                break
+
+            node = max(
+                live_children,
+                key=lambda child: child.puct_score(self.config.puct_c, node.visit_count),
+            )
+
+            if node.depth >= self.config.puct_max_depth:
+                break
+
+        expandable = self._collect_expandable_puct_nodes(root)
+        if not expandable:
+            return root
+        return max(
+            expandable,
+            key=lambda candidate: candidate.puct_score(
+                self.config.puct_c,
+                candidate.parent.visit_count if candidate.parent else candidate.visit_count,
+            ),
+        )
+
+    def _collect_expandable_puct_nodes(self, root: ProgramSearchNode) -> list[ProgramSearchNode]:
+        nodes: list[ProgramSearchNode] = []
+
+        def visit(node: ProgramSearchNode) -> None:
+            if (
+                not node.discarded
+                and node.depth < self.config.puct_max_depth
+                and len(node.children) < self.config.puct_children_per_node
+            ):
+                nodes.append(node)
+            for child in node.children:
+                visit(child)
+
+        visit(root)
+        return nodes
+
+    def _build_fixed_judge_eval_set(
+        self,
+        failures: list[tuple[AgentTrace, str, str, str, str]],
+    ) -> list[tuple[AgentTrace, str, str, str, str]]:
+        """Build a deterministic capped judge set from base failures."""
+        limit = self.config.judge_eval_sample_count
+        if limit is None or limit <= 0 or limit >= len(failures):
+            return list(failures)
+
+        by_category: dict[str, list[tuple[AgentTrace, str, str, str, str]]] = {}
+        for failure in failures:
+            by_category.setdefault(failure[4], []).append(failure)
+
+        selected: list[tuple[AgentTrace, str, str, str, str]] = []
+        categories = sorted(by_category)
+        offset = 0
+        while len(selected) < limit and categories:
+            made_progress = False
+            for category in categories:
+                pool = by_category[category]
+                if offset < len(pool):
+                    selected.append(pool[offset])
+                    made_progress = True
+                    if len(selected) >= limit:
+                        break
+            if not made_progress:
+                break
+            offset += 1
+        return selected
+
+    def _sample_proposal_failures(
+        self,
+        failures: list[tuple[AgentTrace, str, str, str, str]],
+        categories: list[str],
+    ) -> list[tuple[AgentTrace, str, str, str, str]]:
+        """Sample a rotating category-aware batch for proposal generation."""
+        if not failures:
+            return []
+
+        n_cats = len(categories)
+        if n_cats == 0:
+            return failures[: self.config.samples_per_category]
+
+        n_cats_this_iter = min(self.config.categories_per_batch, n_cats)
+        batch: list[tuple[AgentTrace, str, str, str, str]] = []
+        for j in range(n_cats_this_iter):
+            cat_idx = (self._category_offset + j) % n_cats
+            cat = categories[cat_idx]
+            cat_failures = [f for f in failures if f[4] == cat]
+            samples_to_take = min(self.config.samples_per_category, len(cat_failures))
+            offset = self._per_cat_offset.get(cat, 0)
+            for k in range(samples_to_take):
+                idx = (offset + k) % len(cat_failures) if cat_failures else 0
+                if idx < len(cat_failures):
+                    batch.append(cat_failures[idx])
+            if cat_failures:
+                self._per_cat_offset[cat] = offset + samples_to_take
+        self._category_offset += n_cats_this_iter
+
+        if not batch:
+            return failures[: self.config.samples_per_category]
+        return batch
+
+    def _add_puct_child(
+        self,
+        parent: ProgramSearchNode,
+        child_name: str,
+        score: float,
+        prior: float,
+        discarded: bool = False,
+    ) -> ProgramSearchNode:
+        child = ProgramSearchNode(
+            name=child_name,
+            parent=parent,
+            prior=max(0.05, min(1.0, prior)),
+            score=score,
+            depth=parent.depth + 1,
+            discarded=discarded,
+        )
+        parent.children.append(child)
+        self._backpropagate_puct(child, score)
+        return child
+
+    def _find_puct_node(
+        self,
+        root: ProgramSearchNode,
+        name: str,
+    ) -> ProgramSearchNode | None:
+        if root.name == name:
+            return root
+        for child in root.children:
+            found = self._find_puct_node(child, name)
+            if found is not None:
+                return found
+        return None
+
+    def _update_puct_node_score(
+        self,
+        root: ProgramSearchNode,
+        name: str,
+        score: float,
+    ) -> None:
+        """Update a node score and adjust backpropagated totals by the delta."""
+        node = self._find_puct_node(root, name)
+        if node is None:
+            return
+        delta = score - node.score
+        if abs(delta) < 1e-12:
+            return
+        node.score = score
+        current: ProgramSearchNode | None = node
+        while current is not None:
+            current.total_q += delta
+            current = current.parent
+
+    @staticmethod
+    def _backpropagate_puct(node: ProgramSearchNode, value: float) -> None:
+        current: ProgramSearchNode | None = node
+        while current is not None:
+            current.visit_count += 1
+            current.total_q += value
+            current = current.parent
+
+    @staticmethod
+    def _format_puct_path(node: ProgramSearchNode) -> str:
+        path = []
+        current: ProgramSearchNode | None = node
+        while current is not None:
+            path.append(current.name)
+            current = current.parent
+        return " -> ".join(reversed(path))
+
+    async def _judge_skill_with_llm(
+        self,
+        failures_ext: list[tuple[AgentTrace, str, str, str, str]],
+        provider: str,
+        model: str,
+        child_name: str = "candidate",
+        parent_name: str = "parent",
+        proposal: str = "",
+        justification: str = "",
+        parent_skill_summary: str = "",
+        candidate_skill_summary: str = "",
+        skill_diff: str = "",
+        candidate_skills_content: str = "",
+    ) -> JudgeResult:
+        """Estimate failure-recovery quality with LLM-judged Elo matches.
+
+        Makes one lightweight API call per failure (no agent re-run).
+        Returns Elo ratings plus a calibrated failure-fix estimate in [0, 1].
+        """
+        import json
+        skills_content = candidate_skills_content or self._get_all_skills_content()
+        semaphore = asyncio.Semaphore(self.config.judge_concurrency)
+        child_rating = self.config.judge_elo_initial_rating
+        opponent_rating = self.config.judge_elo_initial_rating
+        scale = self.config.judge_elo_scale
+        k_factor = self.config.judge_elo_k
+
+        async def judge_one(index: int, trace: AgentTrace, question: str, agent_answer: str, ground_truth: str, category: str) -> dict[str, Any]:
+            async with semaphore:
+                trace_summary = trace.summarize(head_chars=3000, tail_chars=1500)
+                prompt = build_judge_query(
+                    trace_summary,
+                    question,
+                    agent_answer,
+                    ground_truth,
+                    skills_content,
+                    proposal=proposal,
+                    justification=justification,
+                    parent_skill_summary=parent_skill_summary,
+                    candidate_skill_summary=candidate_skill_summary,
+                    skill_diff=skill_diff,
+                )
+                try:
+                    text = await self._call_judge_api(prompt, provider, model)
+                    text = text.strip()
+                    # Strip markdown code fences if present
+                    if text.startswith("```"):
+                        text = "\n".join(text.split("\n")[1:])
+                        text = text.rsplit("```", 1)[0].strip()
+                    data = json.loads(text)
+                    data["_raw_response"] = text
+                    data["_index"] = index
+                    data["_category"] = category
+                    return data
+                except Exception as e:
+                    _log("WARN", f"  Judge call failed ({type(e).__name__}): {e}")
+                    return {
+                        "_raw_response": "",
+                        "_index": index,
+                        "_category": category,
+                        "would_succeed": False,
+                        "confidence": 0.0,
+                        "hypothetical_action": "",
+                        "reasoning": f"Judge call failed: {type(e).__name__}: {e}",
+                        "_valid": False,
+                    }
+
+        raw_results = await asyncio.gather(*[
+            judge_one(i, t, q, ans, gt, cat)
+            for i, (t, q, ans, gt, cat) in enumerate(failures_ext, start=1)
+        ])
+
+        matches: list[JudgeMatchResult] = []
+        direct_scores: list[float] = []
+        for data in sorted(raw_results, key=lambda item: int(item.get("_index", 0))):
+            is_valid = bool(data.get("_valid", True))
+            if not is_valid:
+                result = JudgeMatchResult(
+                    index=int(data.get("_index", len(matches) + 1)),
+                    category=str(data.get("_category", "")),
+                    would_succeed=False,
+                    confidence=0.0,
+                    match_score=0.5,
+                    expected_before=self._elo_expected(child_rating, opponent_rating, scale),
+                    child_rating_after=child_rating,
+                    opponent_rating_after=opponent_rating,
+                    hypothetical_action=str(data.get("hypothetical_action", "")),
+                    reasoning=str(data.get("reasoning", "")),
+                    raw_response=str(data.get("_raw_response", "")),
+                    valid=False,
+                )
+                matches.append(result)
+                if self.config.judge_log_details:
+                    _log(
+                        "JUDGE MATCH",
+                        (
+                            f"{child_name} vs {parent_name} #{result.index} "
+                            f"cat={result.category} invalid judge result; skipped"
+                        ),
+                    )
+                    _log("", f"  reasoning: {result.reasoning}")
+                continue
+
+            confidence = self._clamp01(data.get("confidence"), default=0.5)
+            would_succeed = bool(data.get("would_succeed"))
+            has_probability_score = (
+                "probability_of_success" in data
+                or "skill_addresses_root_cause" in data
+            )
+            if has_probability_score:
+                match_score = self._judge_probability_to_match_score(
+                    data.get("probability_of_success"),
+                    data.get("skill_addresses_root_cause"),
+                )
+                would_succeed = match_score >= 0.5
+            elif self.config.judge_scoring == "average":
+                match_score = confidence if would_succeed else 0.0
+            else:
+                match_score = self._judge_binary_to_match_score(would_succeed, confidence)
+
+            expected_before = self._elo_expected(child_rating, opponent_rating, scale)
+            child_rating += k_factor * (match_score - expected_before)
+            opponent_expected = 1.0 - expected_before
+            opponent_rating += k_factor * ((1.0 - match_score) - opponent_expected)
+            direct_scores.append(match_score)
+
+            result = JudgeMatchResult(
+                index=int(data.get("_index", len(matches) + 1)),
+                category=str(data.get("_category", "")),
+                would_succeed=would_succeed,
+                confidence=confidence,
+                match_score=match_score,
+                expected_before=expected_before,
+                child_rating_after=child_rating,
+                opponent_rating_after=opponent_rating,
+                hypothetical_action=str(data.get("hypothetical_action", "")),
+                reasoning=str(data.get("reasoning", "")),
+                raw_response=str(data.get("_raw_response", "")),
+                valid=True,
+                root_cause=str(data.get("root_cause", "")),
+                skill_addresses_root_cause=self._clamp01(
+                    data.get("skill_addresses_root_cause"),
+                    default=0.0,
+                ),
+                probability_of_success=self._clamp01(
+                    data.get("probability_of_success"),
+                    default=match_score,
+                ),
+                remaining_blockers=[
+                    str(item) for item in data.get("remaining_blockers", [])[:5]
+                ]
+                if isinstance(data.get("remaining_blockers"), list)
+                else [],
+            )
+            matches.append(result)
+
+            if self.config.judge_log_details:
+                _log(
+                    "JUDGE MATCH",
+                    (
+                        f"{child_name} vs {parent_name} #{result.index} "
+                        f"cat={result.category} outcome={result.match_score:.3f} "
+                        f"expected={result.expected_before:.3f} "
+                        f"rating={result.child_rating_after:.1f}/{result.opponent_rating_after:.1f} "
+                        f"would_succeed={result.would_succeed} confidence={result.confidence:.3f} "
+                        f"p_success={result.probability_of_success:.3f} "
+                        f"root_fit={result.skill_addresses_root_cause:.3f}"
+                    ),
+                )
+                if result.root_cause:
+                    _log("", f"  root_cause: {result.root_cause}")
+                _log("", f"  action: {result.hypothetical_action}")
+                if result.remaining_blockers:
+                    _log("", f"  blockers: {', '.join(result.remaining_blockers)}")
+                _log("", f"  reasoning: {result.reasoning}")
+                _log("", f"  raw: {result.raw_response}")
+
+        average_match_score = sum(direct_scores) / len(direct_scores) if direct_scores else 0.0
+        if not direct_scores:
+            reasons = "; ".join(match.reasoning for match in matches[:3])
+            raise RuntimeError(f"All judge calls failed; cannot score candidate. {reasons}")
+        expected_win_rate = self._elo_expected(child_rating, opponent_rating, scale)
+
+        if self.config.judge_scoring == "average":
+            estimated_fix_rate = average_match_score
+        else:
+            # Equal Elo means "no evidence of recovery over the failed baseline";
+            # only rating above the opponent contributes to estimated recovery.
+            estimated_fix_rate = max(0.0, min(1.0, 2.0 * (expected_win_rate - 0.5)))
+
+        return JudgeResult(
+            estimated_fix_rate=estimated_fix_rate,
+            average_match_score=average_match_score,
+            child_rating=child_rating,
+            opponent_rating=opponent_rating,
+            expected_win_rate=expected_win_rate,
+            matches=matches,
+        )
+
+    async def _run_with_llm_judge(self) -> LoopResult:
+        """LLM Judge mode: collect all trajectories once, then iterate on skill
+        evolution using lightweight LLM judge calls instead of full agent re-evaluation.
+
+        Key differences from the original run():
+        - No train/val split: all data is run once at the start.
+        - Skill quality is judged by asking an LLM to predict whether the new
+          skill would have helped each failing trajectory.
+        - The full agent is never re-run during the evolution loop.
+        """
+        # 0. Handle continue mode / feedback reset
+        if not self.config.continue_mode:
+            if self.config.reset_feedback and self._feedback_path.exists():
+                self._feedback_path.unlink()
+            self._iteration_offset = 0
+            self._delete_checkpoint()
+            reset_manager = getattr(self.manager, "reset", None)
+            if callable(reset_manager):
+                reset_manager()
+                _log("INIT", "Reset local program state for fresh run")
+        else:
+            self._iteration_offset = self._get_highest_iteration()
+
+        # 1. Ensure base program exists
+        if "base" not in self.manager.list_programs():
+            current_options = self.agents.base._get_options()
+            base_config = options_to_config(current_options, "base")
+            self.manager.create_program("base", base_config)
+            _log("INIT", "Created base program")
+        else:
+            _log("INIT", "Using existing base program")
+        self.manager.switch_to("base")
+
+        # 2. Obtain trajectories — either from preloaded data or by running all samples now
+        if self._preloaded_trajectories is not None:
+            extended_traces = self._preloaded_trajectories
+            _log("COLLECT", f"Using {len(extended_traces)} pre-collected trajectories (skipping agent inference)")
+        else:
+            all_data = self._get_all_data()
+            _log("COLLECT", f"Running all {len(all_data)} samples upfront (no train/val split)...")
+            self._iter_cost = 0.0
+            extended_traces = await self._collect_all_trajectories(all_data)
+            self._total_cost += self._iter_cost
+            _log("COST", f"Trajectory collection: ${self._iter_cost:.4f}")
+
+        # 3. Compute base score and partition failures
+        all_failures_ext: list[tuple[AgentTrace, str, str, str, str]] = []
+        passed = 0
+        for trace, question, agent_answer, ground_truth, category in extended_traces:
+            score = self.scorer(question, agent_answer.strip().lower(), ground_truth.strip().lower())
+            if score >= 0.8:
+                passed += 1
+            else:
+                all_failures_ext.append((trace, question, agent_answer, ground_truth, category))
+
+        total = len(extended_traces)
+        base_score = passed / total if total > 0 else 0.0
+        _log(
+            "COLLECT",
+            f"Base score: {base_score:.4f} ({passed}/{total} passed, {len(all_failures_ext)} failures)",
+        )
+        judge_eval_failures_ext = self._build_fixed_judge_eval_set(all_failures_ext)
+        if self.config.judge_eval_sample_count and self.config.judge_eval_sample_count > 0:
+            _log(
+                "JUDGE",
+                (
+                    f"Fixed judge eval set: {len(judge_eval_failures_ext)}/"
+                    f"{len(all_failures_ext)} base failures"
+                ),
+            )
+        else:
+            _log("JUDGE", "Fixed judge eval set disabled; using each proposal batch for scoring")
+        self.manager.update_frontier("base", base_score, max_size=self.config.frontier_size)
+        self._emit("baseline", score=base_score, n_skills=len(self._get_active_skills()))
+        search_root = self._build_program_search_tree(base_score)
+        bt_matches: list[BradleyTerryMatch] = []
+        bt_players: set[str] = {"base"}
+        bt_ratings: dict[str, float] = {
+            "base": self.config.judge_elo_initial_rating,
+        }
+        _log(
+            "PUCT",
+            (
+                f"Enabled: c={self.config.puct_c}, max_depth={self.config.puct_max_depth}, "
+                f"children_per_node={self.config.puct_children_per_node}, "
+                f"children_per_iteration={self.config.children_per_iteration}"
+            ),
+        )
+
+        # Determine judge provider/model once
+        judge_provider, judge_model = self._detect_judge_provider_and_model()
+        _log("JUDGE", f"Judge: {judge_provider} / {judge_model}")
+        if self.config.judge_scoring == "bradley_terry":
+            _log("JUDGE", "Scoring: global Bradley-Terry league over all generated nodes")
+
+        # 4. Evolution loop
+        # Categories come from trajectories when preloaded, else from train_pools
+        if self._preloaded_trajectories is not None:
+            categories = sorted({entry[4] for entry in extended_traces})
+        else:
+            categories = sorted(self.train_pools.keys())
+        n_cats = len(categories)
+        no_improvement_count = 0
+        iteration_count = 0
+
+        for i in range(self.config.max_iterations):
+            iteration_count = i + 1
+            actual_iteration = iteration_count + self._iteration_offset
+
+            parent_node = self._select_puct_node(search_root)
+            parent = parent_node.name
+            self.manager.switch_to(parent)
+            self._iter_cost = 0.0
+            _log(
+                f"ITER {iteration_count}/{self.config.max_iterations}",
+                (
+                    f"Parent: {parent} | PUCT path: {self._format_puct_path(parent_node)} | "
+                    f"q={parent_node.q_value:.4f}, visits={parent_node.visit_count}, "
+                    f"children={len(parent_node.children)}"
+                ),
+            )
+            self._emit("iter_start", iteration=actual_iteration, total=self.config.max_iterations, parent=parent)
+
+            parent_score = parent_node.score
+            parent_skills_content = self._get_all_skills_content()
+
+            if not all_failures_ext:
+                _log("", "  -> No failures remaining")
+                break
+
+            batch_failures_ext = self._sample_proposal_failures(all_failures_ext, categories)
+            scoring_failures_ext = (
+                judge_eval_failures_ext
+                if self.config.judge_eval_sample_count and self.config.judge_eval_sample_count > 0
+                else batch_failures_ext
+            )
+
+            # Convert to legacy format (trace, agent_answer, ground_truth, category) for _mutate
+            batch_failures = [(t, ans, gt, cat) for t, _q, ans, gt, cat in batch_failures_ext]
+            _log(
+                "",
+                (
+                    f"  Using {len(batch_failures)} proposal failures; "
+                    f"judging on {len(scoring_failures_ext)} failures..."
+                ),
+            )
+
+            target_children = max(1, self.config.children_per_iteration)
+            remaining_child_slots = max(
+                0,
+                self.config.puct_children_per_node - len(parent_node.children),
+            )
+            children_to_generate = min(target_children, remaining_child_slots)
+            if children_to_generate <= 0:
+                _log("", "  [SKIP] Selected parent has no remaining child slots")
+                no_improvement_count += 1
+                continue
+
+            _log(
+                "",
+                (
+                    f"  Expanding {children_to_generate}/{target_children} child "
+                    f"candidate(s) from {parent}"
+                ),
+            )
+            any_child_added = False
+            any_child_created = False
+
+            for child_idx in range(children_to_generate):
+                self.manager.switch_to(parent)
+                child_iteration_id: int | str
+                if target_children == 1:
+                    child_iteration_id = actual_iteration
+                else:
+                    child_iteration_id = f"{actual_iteration}-{child_idx + 1}"
+
+                _log(
+                    "CHILD",
+                    f"{child_idx + 1}/{children_to_generate} from parent {parent}",
+                )
+                mutation_result = await self._mutate_with_fallback(
+                    parent,
+                    batch_failures,
+                    child_iteration_id,
+                )
+
+                if mutation_result is None:
+                    _log("", "  [WARN] Child generation failed")
+                    continue
+
+                any_child_created = True
+                child_name, proposal, justification, proposer_confidence = mutation_result
+                candidate_skills_content = self._get_all_skills_content()
+                parent_skill_summary = self._summarize_skill_content(parent_skills_content)
+                candidate_skill_summary = self._summarize_skill_content(candidate_skills_content)
+                skill_diff = self._diff_skill_content(parent_skills_content, candidate_skills_content)
+
+                # Judge with LLM — no full agent re-run
+                _log("", f"  -> Judging {child_name} via LLM ({judge_provider}/{judge_model})...")
+                judge_result = await self._judge_skill_with_llm(
+                    scoring_failures_ext,
+                    judge_provider,
+                    judge_model,
+                    child_name=child_name,
+                    parent_name=parent,
+                    proposal=proposal,
+                    justification=justification,
+                    parent_skill_summary=parent_skill_summary,
+                    candidate_skill_summary=candidate_skill_summary,
+                    skill_diff=skill_diff,
+                    candidate_skills_content=candidate_skills_content,
+                )
+
+                # Estimate total score: Elo-estimated fix rate is the fraction of
+                # failed samples the child is expected to recover. Scale it to the
+                # observed base-score space.
+                if self.config.judge_scoring == "bradley_terry":
+                    bt_players.update({parent, child_name})
+                    bt_matches.extend(
+                        BradleyTerryMatch(
+                            player=child_name,
+                            opponent=parent,
+                            score=match.match_score,
+                            category=match.category,
+                            index=match.index,
+                        )
+                        for match in judge_result.matches
+                        if match.valid
+                    )
+                    bt_ratings = self._fit_bradley_terry_ratings(
+                        bt_matches,
+                        sorted(bt_players),
+                        anchor="base",
+                        initial_rating=self.config.judge_elo_initial_rating,
+                        scale=self.config.judge_elo_scale,
+                    )
+                    base_rating = bt_ratings.get("base", self.config.judge_elo_initial_rating)
+                    child_rating = bt_ratings.get(child_name, self.config.judge_elo_initial_rating)
+                    child_score = self._rating_to_score(
+                        child_rating,
+                        base_rating,
+                        base_score,
+                        self.config.judge_elo_scale,
+                    )
+                    for rated_name, rating in bt_ratings.items():
+                        if rated_name not in bt_players:
+                            continue
+                        rated_score = (
+                            base_score
+                            if rated_name == "base"
+                            else self._rating_to_score(
+                                rating,
+                                base_rating,
+                                base_score,
+                                self.config.judge_elo_scale,
+                            )
+                        )
+                        self.manager.update_frontier(
+                            rated_name,
+                            rated_score,
+                            max_size=self.config.frontier_size,
+                        )
+                        self._update_puct_node_score(search_root, rated_name, rated_score)
+
+                    expected_win = self._elo_expected(
+                        child_rating,
+                        base_rating,
+                        self.config.judge_elo_scale,
+                    )
+                    _log(
+                        "",
+                        (
+                            f"  -> Judge BT: global_rating={child_rating:.1f} "
+                            f"base_rating={base_rating:.1f}, expected_vs_base={expected_win:.3f}, "
+                            f"avg_match={judge_result.average_match_score:.3f} "
+                            f"→ global score {child_score:.4f}"
+                        ),
+                    )
+                else:
+                    child_score = base_score + judge_result.estimated_fix_rate * (1.0 - base_score)
+                    _log(
+                        "",
+                        (
+                            f"  -> Judge Elo: fix_rate={judge_result.estimated_fix_rate:.3f}, "
+                            f"avg_match={judge_result.average_match_score:.3f}, "
+                            f"rating={judge_result.child_rating:.1f}/{judge_result.opponent_rating:.1f}, "
+                            f"expected_win={judge_result.expected_win_rate:.3f} "
+                            f"→ estimated score {child_score:.4f}"
+                        ),
+                    )
+
+                added = self.manager.update_frontier(child_name, child_score, max_size=self.config.frontier_size)
+
+                if added:
+                    outcome = "improved" if child_score > parent_score else "kept"
+                    _log("", f"  [OK] Added to frontier (score: {child_score:.4f})")
+                    any_child_added = True
+                else:
+                    outcome = "not_frontier"
+                    _log("", f"  [SKIP] Not added to frontier (score: {child_score:.4f}); kept for PUCT exploration")
+
+                child_node = self._add_puct_child(
+                    parent_node,
+                    child_name,
+                    child_score,
+                    prior=self._proposal_policy_prior(proposer_confidence),
+                    discarded=False,
+                )
+                _log(
+                    "PUCT",
+                    (
+                        f"Backpropagated {child_score:.4f} through {self._format_puct_path(child_node)}; "
+                        f"prior={child_node.prior:.3f}, "
+                        f"parent q={parent_node.q_value:.4f}, visits={parent_node.visit_count}"
+                    ),
+                )
+
+                self._emit(
+                    "eval_result",
+                    child_name=child_name,
+                    score=child_score,
+                    parent_score=parent_score,
+                    added=added,
+                    frontier=self.manager.get_frontier_with_scores(),
+                    n_skills=len(self._get_active_skills()),
+                )
+                append_feedback(
+                    self._feedback_path,
+                    child_name,
+                    proposal,
+                    justification,
+                    outcome=outcome,
+                    score=child_score,
+                    parent_score=parent_score,
+                    active_skills=self._get_active_skills(),
+                )
+
+            if any_child_added:
+                no_improvement_count = 0
+            elif any_child_created:
+                no_improvement_count += 1
+            else:
+                no_improvement_count += 1
+
+            if no_improvement_count >= self.config.no_improvement_limit:
+                _log("STOP", f"No improvement for {self.config.no_improvement_limit} iterations")
+                break
+
+            frontier_str = ", ".join(f"{n}:{s:.2f}" for n, s in self.manager.get_frontier_with_scores())
+            _log("", f"  Frontier: [{frontier_str}]")
+            self._total_cost += self._iter_cost
+            _log("COST", f"Iter {iteration_count} cost: ${self._iter_cost:.4f} | Running total: ${self._total_cost:.4f}")
+            self._save_checkpoint(actual_iteration)
+
+        # 5. Return results
+        frontier = self.manager.get_frontier_with_scores()
+        best = self.manager.get_best_from_frontier()
+        best_score = frontier[0][1] if frontier else 0.0
+        _log("DONE", f"{iteration_count} iterations, best: {best or 'base'} ({best_score:.4f})")
+        _log("COST", f"Total cost: ${self._total_cost:.4f}")
+        self._emit("loop_done", best=best or "base", best_score=best_score, iterations=iteration_count)
+        return LoopResult(
+            frontier=frontier,
+            best_program=best or "base",
+            best_score=best_score,
+            iterations_completed=iteration_count,
+            total_cost_usd=self._total_cost,
+        )

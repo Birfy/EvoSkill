@@ -39,6 +39,28 @@ _EXTRACTION_SYSTEM_PROMPT = (
 )
 
 
+def _make_openai_strict_schema(schema: dict) -> dict:
+    """Recursively add additionalProperties: false to all object nodes.
+
+    OpenAI strict mode requires this on every object in the schema tree.
+    """
+    schema = dict(schema)
+    if schema.get("type") == "object" or "properties" in schema:
+        schema.setdefault("additionalProperties", False)
+        if "properties" in schema:
+            schema["properties"] = {
+                k: _make_openai_strict_schema(v)
+                for k, v in schema["properties"].items()
+            }
+    for key in ("$defs", "definitions"):
+        if key in schema:
+            schema[key] = {
+                k: _make_openai_strict_schema(v)
+                for k, v in schema[key].items()
+            }
+    return schema
+
+
 def _import_openhands_sdk() -> Any:
     try:
         return importlib.import_module("openhands.sdk")
@@ -312,7 +334,7 @@ async def _run_fallback_extraction(
     result_text: str,
     response_model: Type[BaseModel],
 ) -> tuple[BaseModel | None, Any | None, str | None]:
-    schema = response_model.model_json_schema()
+    schema = _make_openai_strict_schema(response_model.model_json_schema())
     extraction_query = (
         f"Original user query:\n{query}\n\n"
         f"Assistant final answer:\n{result_text}\n"
@@ -335,7 +357,7 @@ async def _run_fallback_extraction(
             "json_schema": {
                 "name": response_model.__name__,
                 "schema": schema,
-                "strict": True,
+                "strict": False,
             },
         },
         temperature=0,

@@ -95,7 +95,11 @@ Based on your analysis, provide:
    - Reference any related past iterations (especially DISCARDED ones)
    - Explain how your proposal addresses the identified gap
 
-5. **related_iterations**: List of relevant past iterations (e.g., ["iter-4", "iter-9"])
+5. **confidence**: A number from 0.0 to 1.0 estimating how likely this proposal is to address the observed failure pattern before any judge/evaluation is run.
+   - Use higher values only when the root cause is clear and the proposal directly targets it.
+   - Use lower values when the diagnosis is uncertain, narrow, or likely to depend on brittle table/source selection.
+
+6. **related_iterations**: List of relevant past iterations (e.g., ["iter-4", "iter-9"])
 
 ## Example Analyses
 
@@ -107,6 +111,7 @@ Based on your analysis, provide:
 - target_skill: "financial-methodology-guide"
 - proposed_skill: "Extend the ES/CVaR section to include multi-period calculations. Add: (1) rolling window ES computation, (2) confidence interval adjustment for different time horizons, (3) examples showing ES at 1-day, 5-day, and 10-day horizons."
 - justification: "The existing financial-methodology-guide skill covers basic ES but doesn't address the multi-period case seen in failure 1. Rather than creating a redundant skill, we should extend the existing methodology guide. Iter-3 was DISCARDED for proposing a separate 'multi-period-risk' skill - this proposal adds to the existing skill instead."
+- confidence: 0.78
 - related_iterations: ["iter-3"]
 </example>
 
@@ -118,6 +123,7 @@ Based on your analysis, provide:
 - target_skill: null
 - proposed_skill: "Create a 'bond-notation-parser' skill that handles Treasury price notation. It should: (1) recognize 32nds format (e.g., 99.16 = 99 + 16/32), (2) handle the '+' suffix (e.g., 99.16+ = 99 + 16.5/32), (3) validate that fractional parts are 00-31, (4) provide clear examples and conversion formulas."
 - justification: "No existing skill covers notation parsing. The trace shows the agent interpreted '99.16' as decimal 99.16 instead of 99.5 (99 + 16/32). This is a distinct capability not covered by existing methodology skills."
+- confidence: 0.82
 - related_iterations: []
 </example>
 
@@ -129,6 +135,7 @@ Based on your analysis, provide:
 - target_skill: null
 - proposed_skill: "The agent needs a real-time stock price retrieval capability. This skill should accept a stock ticker symbol as input and return current market data including the latest price, daily change (absolute and percentage), and trading volume. It should handle invalid tickers gracefully and indicate whether markets are currently open or closed."
 - justification: "At step 3 in the trace, the agent correctly identified the need for current pricing data and attempted to use its historical data tool. However, the ground truth required real-time information from today's trading session. The agent's reasoning was sound but it lacked the necessary data access. No existing skill provides real-time market data access."
+- confidence: 0.86
 - related_iterations: []
 </example>
 """

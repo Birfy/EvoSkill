@@ -7,6 +7,7 @@ from typing import Literal
 
 EvolutionMode = Literal["prompt_only", "skill_only"]
 SelectionStrategy = Literal["best", "random", "round_robin"]
+JudgeScoring = Literal["elo", "average", "bradley_terry"]
 
 
 @dataclass
@@ -67,3 +68,34 @@ class LoopConfig:
 
     # Multi-sample per category: collect N samples per category before proposing
     samples_per_category: int = 2  # Helps identify patterns within categories
+
+    # LLM Judge mode: run all trajectories once upfront (no train/val split),
+    # then use a lightweight direct API call to judge skill changes instead of
+    # re-running the full agent on a validation set.
+    use_llm_judge: bool = False
+    # Model for judge calls. None = auto-pick a small model for the active SDK
+    # (Anthropic → claude-haiku-4-5-20251001, OpenAI → gpt-4o-mini).
+    judge_model: str | None = None
+    judge_concurrency: int = 8
+    # Judge scoring mode. "elo" treats each judged failure as a pairwise match
+    # between the child program and the baseline/parent behavior.
+    # "bradley_terry" stores all pairwise match records in one global league
+    # and refits ratings after each child so node scores are comparable.
+    # "average" keeps the older direct mean of fixed-failure confidences.
+    judge_scoring: JudgeScoring = "elo"
+    judge_elo_initial_rating: float = 1500.0
+    judge_elo_k: float = 128.0
+    judge_elo_scale: float = 400.0
+    judge_log_details: bool = True
+    # Optional fixed judge set size for LLM-judge scoring. When set, proposal
+    # generation may still use a small rotating batch, but every child is judged
+    # against the same capped set of base failures for comparable scores.
+    # None or <=0 means use the per-iteration proposal batch for judging.
+    judge_eval_sample_count: int | None = None
+
+    # PUCT tree search for LLM-judge evolution mode.
+    puct_c: float = 0.5
+    puct_max_depth: int = 3
+    puct_children_per_node: int = 2
+    children_per_iteration: int = 2
+    puct_default_prior: float = 0.5

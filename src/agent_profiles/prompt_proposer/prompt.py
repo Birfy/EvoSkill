@@ -50,6 +50,10 @@ Based on your analysis, provide:
    - Explain how your proposal addresses the identified gap
    - Describe the expected improvement in agent behavior
 
+3. **confidence**: A number from 0.0 to 1.0 estimating how likely this prompt change is to address the observed failure pattern before any judge/evaluation is run.
+   - Use higher values only when the root cause is clear and the proposed behavior directly targets it.
+   - Use lower values when the diagnosis is uncertain, narrow, or likely to depend on brittle source selection.
+
 ## Example Analyses
 
 <example type="tool_usage">
@@ -58,6 +62,7 @@ Based on your analysis, provide:
 **Proposal**:
 - proposed_prompt_change: "The agent needs explicit instructions to always delegate numerical computations to available tools rather than performing mental math. The prompt should emphasize that even seemingly simple calculations should use the calculator tool, explain that this prevents accumulation of rounding errors, and establish a clear rule: if a task involves numbers, use a computational tool."
 - justification: "The trace shows at steps 5-7 the agent attempted to compute compound interest manually, introducing a rounding error that propagated to the final answer. The calculator tool was available but unused. This is a behavioral issue that clearer instructions can resolve."
+- confidence: 0.80
 </example>
 
 <example type="verification">
@@ -66,6 +71,7 @@ Based on your analysis, provide:
 **Proposal**:
 - proposed_prompt_change: "The agent needs instructions emphasizing verification before final answers. The prompt should require the agent to: (1) state its preliminary answer, (2) identify ways to verify or cross-check, (3) perform verification using available tools, (4) only then provide the final answer. This 'verify before submit' mindset should be reinforced as a core principle."
 - justification: "At step 4, the agent arrived at an answer and immediately provided it without cross-referencing available data. The ground truth shows the answer was incorrect due to a misremembered fact that could have been verified. Adding verification instructions would catch such errors."
+- confidence: 0.72
 </example>
 
 <example type="reasoning_approach">
@@ -74,6 +80,7 @@ Based on your analysis, provide:
 **Proposal**:
 - proposed_prompt_change: "The agent needs instructions for balanced comparative analysis. The prompt should emphasize: (1) explicitly list all options being compared, (2) analyze each option using the same criteria, (3) create a structured comparison (pros/cons, table, or similar), (4) only then make a recommendation. The agent should be reminded that thorough comparison requires equal attention to all alternatives."
 - justification: "The trace shows the agent deeply analyzed Option A (steps 2-5) but only briefly mentioned Option B (step 6) before recommending A. The ground truth expected consideration of B's advantages, which were overlooked. This is a reasoning approach issue that prompt guidance can address."
+- confidence: 0.76
 </example>
 
 <example type="precision">

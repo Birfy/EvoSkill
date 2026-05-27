@@ -129,6 +129,7 @@ Also join us on [Discord](https://discord.gg/sentientfoundation) to discuss your
 
 - [Installation](#installation)
 - [Quickstart](#quickstart)
+- [Offline Trajectory Evolution](#offline-trajectory-evolution)
 - [Harbor Integration](#harbor-integration)
 - [CLI Reference](#cli-reference)
 - [Configuration Reference](#configuration-reference)
@@ -289,6 +290,72 @@ ls .claude/skills/             # all learned skills
 
 Copy `.claude/program.yaml` and `.claude/skills/` into your deployment to use the evolved agent configuration.
 
+## Offline Trajectory Evolution
+
+For expensive benchmarks, EvoSkill can collect trajectories once and evolve skills offline. This avoids re-running the full agent for every candidate skill while preserving the failure traces, tool calls, answer comparisons, and skill-call records needed for later analysis.
+
+### 1. Collect trajectories
+
+```bash
+python scripts/collect_trajectories.py \
+  --sdk openhands \
+  --model openai/gpt-5.4-nano \
+  --dataset data/questions.csv \
+  --question_column question \
+  --ground_truth_column answer \
+  --category_column difficulty \
+  --project_root examples/officeqa \
+  --output_dir examples/officeqa/.evoskill/trajectories/test20 \
+  --concurrency 2
+```
+
+The output is `trajectories.jsonl`, a reusable JSONL file containing the original question, expected answer, model answer, trace metadata, messages, and extracted skill-call records.
+
+### 2. Optionally compact trajectories
+
+```bash
+python scripts/compact_trajectories.py \
+  --input examples/officeqa/.evoskill/trajectories/test20/trajectories.jsonl \
+  --output examples/officeqa/.evoskill/trajectories/test20/compact.jsonl \
+  --summary examples/officeqa/.evoskill/trajectories/test20/summary.json
+```
+
+The compact form keeps the score, pass/fail label, failure feedback, action trace, and skill-call summary without storing the full raw trajectory text.
+
+### 3. Run offline skill evolution
+
+```bash
+EVOSKILL_NO_GIT=1 python scripts/run_loop.py \
+  --sdk openhands \
+  --model openai/gpt-5.4-nano \
+  --use_llm_judge true \
+  --judge_model openai/gpt-5.4-nano \
+  --judge_scoring bradley_terry \
+  --trajectories_dir examples/officeqa/.evoskill/trajectories/test20 \
+  --project_root examples/officeqa \
+  --max_iterations 5 \
+  --frontier_size 3 \
+  --failure_samples 3 \
+  --puct_c 0.5 \
+  --puct_max_depth 3 \
+  --puct_children_per_node 4 \
+  --children_per_iteration 2 \
+  --judge_eval_samples 8
+```
+
+Important options:
+
+| Option | Description |
+|--------|-------------|
+| `--trajectories_dir` | Loads pre-collected trajectories and skips agent inference during evolution. |
+| `--use_llm_judge true` | Scores candidate skills with direct judge calls instead of full validation reruns. |
+| `--judge_scoring bradley_terry` | Maintains a global pairwise rating table so nodes in the tree are comparable. |
+| `--judge_eval_samples N` | Uses a fixed capped set of base failures to judge every child. Use this to control cost on large failure sets. |
+| `--children_per_iteration N` | Generates multiple children from the selected PUCT parent in one iteration. |
+| `--puct_children_per_node N` | Caps how many children each tree node can expand. |
+| `--puct_default_prior X` | Fallback PUCT prior when the proposer does not return confidence. |
+| `EVOSKILL_NO_GIT=1` | Uses a local filesystem program manager under `.evoskill/local_programs` instead of creating git branches. Useful for dirty worktrees and offline experiments. |
+
 ## Harbor Integration
 
 [Harbor](https://github.com/harbor-framework/harbor) is a framework for evaluating AI agents against containerized benchmark tasks. EvoSkill integrates with Harbor as an alternative to CSV-based datasets, using Harbor's built-in verifiers as the scoring mechanism.
@@ -392,6 +459,22 @@ evoskill run [--continue] [--verbose] [--quiet] [--config PATH] [--docker] [--re
 | `--rebuild` | Force rebuild the Docker image before running |
 
 `evoskill eval` also accepts `--config PATH`.
+
+### Advanced offline loop script
+
+`scripts/run_loop.py` exposes experimental options that are useful when working from a saved trajectory set:
+
+```bash
+python scripts/run_loop.py --help
+```
+
+The offline path supports:
+
+- PUCT tree search over program versions.
+- Multiple child candidates per selected parent.
+- LLM judge scoring from pre-collected failures.
+- Global Bradley-Terry fitting for comparable node ratings.
+- A fixed judge eval set with `--judge_eval_samples` to keep scoring stable and bounded.
 
 ### `evoskill diff`
 
@@ -612,6 +695,43 @@ The self-improvement loop follows five stages:
 5. **Frontier** — Tracks the top-N performing programs as git branches; the best survive to the next iteration.
 
 This cycle repeats for a configurable number of iterations, automatically converging on stronger agent configurations.
+
+### Offline judge mode
+
+Offline judge mode changes the evaluation stage:
+
+1. Run the base agent once and store complete trajectories.
+2. Compute the base score and collect base failures.
+3. Sample a small proposal batch from the failures to generate candidate skill edits.
+4. Judge every candidate on a fixed, capped judge eval set of base failures.
+5. Use the judge results to update the search tree and frontier without re-running the full agent.
+
+This mode is intended for expensive agent runs. It trades exact validation for faster skill search, and top candidates should still be re-run with `evoskill eval` or a benchmark-specific evaluator before deployment.
+
+### PUCT tree search
+
+The offline loop can use PUCT to decide which program node to expand next. Each node is a program version, not a failure example. The score used as `Q` is the node's global value estimate, while the exploration prior comes from the proposer confidence:
+
+```text
+PUCT = Q + c_puct * prior * sqrt(parent_visits) / (1 + child_visits)
+```
+
+- `Q` is backpropagated from judged child scores.
+- `prior` is the proposer confidence field, with `--puct_default_prior` as a fallback.
+- `--children_per_iteration` controls how many child candidates to generate from the selected parent.
+- `--puct_children_per_node` controls how many children each node can hold before search descends deeper.
+
+### Bradley-Terry global ratings
+
+`--judge_scoring bradley_terry` stores judge comparisons from across the whole tree in one global league. After each child is judged, EvoSkill refits a Bradley-Terry model over all observed pairwise records and maps each node's rating relative to `base` back into the score space.
+
+This avoids treating a local `child vs parent` Elo result as a global score. The intended separation is:
+
+```text
+global Bradley-Terry rating -> node value / frontier ranking
+proposer confidence         -> PUCT prior
+fixed judge eval set        -> comparable evidence for every child
+```
 
 ## Git Branches
 

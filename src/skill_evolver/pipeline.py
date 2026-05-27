@@ -1,4 +1,9 @@
-"""End-to-end offline skill evolution pipeline."""
+"""Legacy standalone offline skill evolution pipeline.
+
+Prefer ``scripts/run_loop.py`` for current offline evolution. That path uses
+the shared run-loop program manager, PUCT tree search, trajectory handling,
+and LLM-judge scoring.
+"""
 
 from __future__ import annotations
 
