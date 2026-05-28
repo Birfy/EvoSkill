@@ -65,6 +65,8 @@ from src.schemas import (
 
 from .config import LoopConfig
 from .helpers import (
+    build_answer_comparison_feedback,
+    build_regression_success_feedback,
     build_proposer_query,
     build_skill_query,
     build_prompt_query,
@@ -97,6 +99,19 @@ OPENAI_JUDGE_PRICE_PER_1M: dict[str, tuple[float, float]] = {
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4.1": (2.00, 8.00),
 }
+
+
+@dataclass
+class MutationResult:
+    """Generated child program plus proposer analysis used by later stages."""
+
+    child_name: str
+    proposal: str
+    justification: str
+    proposer_confidence: float
+    root_cause_analysis: str = ""
+    coverage_plan: str = ""
+    regression_risks: str = ""
 
 
 @dataclass
@@ -147,6 +162,9 @@ class JudgeMatchResult:
     root_cause: str = ""
     skill_addresses_root_cause: float = 0.0
     probability_of_success: float = 0.0
+    parent_success_prob: float = 0.0
+    candidate_success_prob: float = 0.0
+    relative_advantage: float = 0.0
     remaining_blockers: list[str] = field(default_factory=list)
 
 
@@ -160,6 +178,7 @@ class JudgeResult:
     opponent_rating: float
     expected_win_rate: float
     matches: list[JudgeMatchResult]
+    uncertainty: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -186,6 +205,9 @@ class ProgramSearchNode:
     depth: int = 0
     discarded: bool = False
     children: list["ProgramSearchNode"] = field(default_factory=list)
+    # Failures this node was judged on — inherited by children so comparisons
+    # are always made on a superset of the parent's evaluation set.
+    scoring_failures: list = field(default_factory=list)
 
     @property
     def q_value(self) -> float:
@@ -217,7 +239,7 @@ class SelfImprovingLoop:
         scorer: Callable[[str, str, str], float] | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         task_constraints: str = "",
-        preloaded_trajectories: list[tuple[Any, str, str, str, str]] | None = None,
+        preloaded_trajectories: list[tuple[Any, ...]] | None = None,
     ):
         """Initialize the self-improving loop.
 
@@ -236,6 +258,7 @@ class SelfImprovingLoop:
                 (AgentTrace, question, agent_answer, ground_truth, category) tuples.
                 When provided and use_llm_judge=True, the loop skips agent inference
                 entirely and uses these trajectories directly for skill evolution.
+                Each tuple is (AgentTrace, question, agent_answer, ground_truth, category, failure_type[, failure_feedback]).
         """
         self.config = config
         self.agents = agents
@@ -252,8 +275,17 @@ class SelfImprovingLoop:
         if preloaded_trajectories:
             cats = sorted({entry[4] for entry in preloaded_trajectories})
             self._per_cat_offset: dict[str, int] = {cat: 0 for cat in cats}
+            failure_types = sorted(
+                {
+                    self._trajectory_failure_type(entry)
+                    for entry in preloaded_trajectories
+                    if self._trajectory_failure_type(entry)
+                }
+            )
+            self._per_failure_type_offset: dict[str, int] = {ft: 0 for ft in failure_types}
         else:
             self._per_cat_offset = {cat: 0 for cat in train_pools.keys()}
+            self._per_failure_type_offset = {}
 
         # Paths
         self._project_root = Path(getattr(self.manager, "cwd", Path.cwd())).resolve()
@@ -496,11 +528,12 @@ class SelfImprovingLoop:
                     agent_answer.strip().lower(),
                     answer.strip().lower(),
                 )
-                status = "[OK]" if avg_score >= 0.8 else "[FAIL]"
+                threshold = self.config.failure_threshold
+                status = "[OK]" if avg_score >= threshold else "[FAIL]"
                 if self.on_event is None:
                     _log("", f"    {status} [{category}] {question[:40]}...")
-                self._emit("sample", question=question, category=category, score=avg_score, passed=avg_score >= 0.8)
-                if avg_score < 0.8:
+                self._emit("sample", question=question, category=category, score=avg_score, passed=avg_score >= threshold)
+                if avg_score < threshold:
                     failures.append((trace, agent_answer, answer, category))
 
             # Always propose if any failures exist
@@ -522,7 +555,9 @@ class SelfImprovingLoop:
             if mutation_result is None:
                 no_improvement_count += 1
             else:
-                child_name, proposal, justification, _proposer_confidence = mutation_result
+                child_name = mutation_result.child_name
+                proposal = mutation_result.proposal
+                justification = mutation_result.justification
 
                 # Evaluate child
                 _log("", f"  -> Evaluating {child_name}...")
@@ -657,6 +692,7 @@ class SelfImprovingLoop:
         iteration: int | str,
         truncation_level: int = 0,
         diversity_hint: str = "",
+        questions: list[str] | None = None,
     ) -> tuple[str, str, str, float] | None:
         """Run proposer and generator to create a mutation based on multiple failures.
 
@@ -666,9 +702,10 @@ class SelfImprovingLoop:
             iteration: Current iteration number.
             truncation_level: Context reduction level (0=full, 1=moderate, 2=aggressive).
             diversity_hint: Optional instruction used to diversify sibling children.
+            questions: Optional parallel list of question texts for the proposer.
 
         Returns:
-            Tuple of (child_name, proposal, justification, proposer_confidence)
+            MutationResult if created, None otherwise.
             if created, None otherwise.
         """
         # Calculate actual iteration number (with offset for continue mode)
@@ -690,6 +727,8 @@ class SelfImprovingLoop:
             self.task_constraints,
             project_root=self._project_root,
             diversity_hint=diversity_hint,
+            questions=questions,
+            domain_hints=self.config.error_surface_hints,
         )
 
         if evolution_mode == "skill_only":
@@ -703,6 +742,9 @@ class SelfImprovingLoop:
             proposer_output = proposer_trace.output
             proposed = proposer_output.proposed_skill
             justification = proposer_output.justification
+            root_cause_analysis = getattr(proposer_output, "root_cause_analysis", "") or ""
+            coverage_plan = getattr(proposer_output, "coverage_plan", "") or ""
+            regression_risks = getattr(proposer_output, "regression_risks", "") or ""
             proposer_confidence = self._clamp01(
                 getattr(proposer_output, "confidence", None),
                 default=self.config.puct_default_prior,
@@ -737,6 +779,15 @@ Modifications needed:
 
 Justification: {justification}
 
+Root cause analysis from proposer:
+{root_cause_analysis or "[not provided]"}
+
+Failure coverage plan:
+{coverage_plan or "[not provided]"}
+
+Regression risks / anti-regression guards:
+{regression_risks or "[not provided]"}
+
 Read the existing skill at .claude/skills/{target_skill}/SKILL.md
 and modify it to add these capabilities. Preserve all existing content that is still relevant."""
             else:
@@ -744,29 +795,103 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 skill_query = build_skill_query_from_skill_proposer(proposer_trace)
 
             skills_before = set(self._get_active_skills())
+            # Capture pre-run content hash for edit-mode diagnostics
+            _pre_skill_hash: str | None = None
+            _changed = False
+            if action_type == "edit" and target_skill:
+                import hashlib
+                _sp = self._project_root / ".claude" / "skills" / target_skill / "SKILL.md"
+                if _sp.exists():
+                    _pre_skill_hash = hashlib.md5(_sp.read_bytes()).hexdigest()
             skill_trace = await self.agents.skill_generator.run(skill_query)
             self._add_iteration_cost(skill_trace.total_cost_usd, "evolution")
+            if skill_trace.is_error or skill_trace.parse_error:
+                _log("", f"  [WARN] Skill generator parse error: {skill_trace.parse_error}")
+            materialized_skill = None
+            if skill_trace.output:
+                materialized_skill = self._materialize_generated_skill(
+                    skill_trace.output,
+                    action_type=action_type,
+                    target_skill=target_skill,
+                    fallback_description=proposed,
+                )
+                if materialized_skill:
+                    _log("", f"  -> Materialized SKILL.md: {materialized_skill}")
             skills_after = set(self._get_active_skills())
             new_skills = skills_after - skills_before
-            created_skill = next(iter(new_skills)) if new_skills else None
+            created_skill = next(iter(new_skills)) if new_skills else materialized_skill
+
+            if action_type == "edit" and target_skill:
+                _sp = self._project_root / ".claude" / "skills" / target_skill / "SKILL.md"
+                if _sp.exists():
+                    import hashlib
+                    _post_hash = hashlib.md5(_sp.read_bytes()).hexdigest()
+                    _changed = _post_hash != _pre_skill_hash
+                    _log("", f"  -> Skill file {'CHANGED' if _changed else 'UNCHANGED'}: {_sp}")
+                else:
+                    _log("", f"  -> Skill file NOT FOUND: {_sp}")
 
             if is_opencode_sdk() or is_openhands_sdk() or is_goose_sdk() or is_codex_sdk():
-                from src.harness.opencode.skill_utils import normalize_project_skill_frontmatter
+                from src.harness.opencode.skill_utils import (
+                    DEFAULT_OPENHANDS_SKILL_TRIGGERS,
+                    normalize_project_skill_frontmatter,
+                )
                 from src.harness.sdk_config import get_sdk
                 skill_descriptions: dict[str, str] = {}
                 if target_skill:
                     skill_descriptions[target_skill] = proposed
                 if created_skill:
                     skill_descriptions[created_skill] = proposed
+                compatibility = get_sdk()
+                skill_triggers = (
+                    {
+                        skill_name: DEFAULT_OPENHANDS_SKILL_TRIGGERS
+                        for skill_name in skill_descriptions
+                    }
+                    if compatibility == "openhands"
+                    else None
+                )
                 normalize_project_skill_frontmatter(
                     self._project_root,
                     descriptions=skill_descriptions,
                     fallback_description=proposed,
-                    compatibility=get_sdk(),
+                    compatibility=compatibility,
+                    triggers_by_skill=skill_triggers,
                 )
 
             if skill_trace.output:
                 self._emit("skill_written", name=created_skill, action=action_type, target=target_skill)
+
+            if action_type == "edit" and target_skill:
+                expected_skill_path = (
+                    self._project_root / ".claude" / "skills" / target_skill / "SKILL.md"
+                )
+                skill_valid = expected_skill_path.exists() and (
+                    _pre_skill_hash is None or _changed
+                )
+                if not skill_valid:
+                    _log(
+                        "",
+                        (
+                            "  [WARN] Skill edit did not produce a changed SKILL.md; "
+                            f"discarding {child_name}"
+                        ),
+                    )
+                    self.manager.discard(child_name)
+                    self.manager.switch_to(parent)
+                    return None
+            else:
+                if not created_skill:
+                    _log(
+                        "",
+                        (
+                            "  [WARN] Skill generator did not create any SKILL.md; "
+                            f"discarding {child_name}"
+                        ),
+                    )
+                    self.manager.discard(child_name)
+                    self.manager.switch_to(parent)
+                    return None
 
         else:  # prompt_only
             proposer_trace = await self.agents.prompt_proposer.run(proposer_query)
@@ -778,6 +903,9 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
             proposed = proposer_trace.output.proposed_prompt_change
             justification = proposer_trace.output.justification
+            root_cause_analysis = ""
+            coverage_plan = ""
+            regression_risks = ""
             proposer_confidence = self._clamp01(
                 getattr(proposer_trace.output, "confidence", None),
                 default=self.config.puct_default_prior,
@@ -808,7 +936,15 @@ and modify it to add these capabilities. Preserve all existing content that is s
         self.manager.commit(f"{child_name}: {proposed[:50]}")
 
         # Return mutation info (feedback will be written by caller with outcome)
-        return (child_name, proposed, justification, proposer_confidence)
+        return MutationResult(
+            child_name=child_name,
+            proposal=proposed,
+            justification=justification,
+            proposer_confidence=proposer_confidence,
+            root_cause_analysis=root_cause_analysis,
+            coverage_plan=coverage_plan,
+            regression_risks=regression_risks,
+        )
 
     async def _mutate_with_fallback(
         self,
@@ -816,6 +952,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
         failures: list[tuple[AgentTrace[AgentResponse], str, str, str]],
         iteration: int | str,
         diversity_hint: str = "",
+        questions: list[str] | None = None,
     ) -> tuple[str, str, str, float] | None:
         """Try progressive truncation levels, then single-failure fallback.
 
@@ -824,9 +961,10 @@ and modify it to add these capabilities. Preserve all existing content that is s
             failures: List of (trace, agent_answer, ground_truth, category) tuples.
             iteration: Current iteration number.
             diversity_hint: Optional instruction used to diversify sibling children.
+            questions: Optional parallel list of question texts for the proposer.
 
         Returns:
-            Tuple of (child_name, proposal, justification, proposer_confidence)
+            MutationResult if created, None otherwise.
             if created, None otherwise.
         """
         max_level = self.config.proposer_max_truncation_level
@@ -841,11 +979,13 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 iteration,
                 truncation_level,
                 diversity_hint=diversity_hint,
+                questions=questions,
             )
             if result is not None:
                 return result
 
-        # Final fallback: single failure focus (if enabled and multiple failures)
+        # Final fallback: single failure focus (if enabled and multiple failures).
+        # questions omitted here — aggressive truncation already strips context.
         if self.config.proposer_single_failure_fallback and len(failures) > 1:
             _log("", f"  -> All truncation levels failed, trying single-failure fallback...")
             single_failure = self._pick_shortest_failure(failures)
@@ -914,6 +1054,92 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     active_skills.append(skill_dir.name)
         return sorted(active_skills)
 
+    def _materialize_generated_skill(
+        self,
+        output: ToolGeneratorResponse,
+        *,
+        action_type: str,
+        target_skill: str | None,
+        fallback_description: str,
+    ) -> str | None:
+        """Write a generator-returned SKILL.md payload into the active program.
+
+        Codex and other sandboxed executors may be able to read the workspace
+        but not write it. In that case the generator returns the intended file
+        content and the main EvoSkill process performs the write.
+        """
+        skill_markdown = str(getattr(output, "skill_markdown", "") or "").strip()
+        generated_skill = str(getattr(output, "generated_skill", "") or "").strip()
+        if not skill_markdown and generated_skill.lstrip().startswith("---"):
+            skill_markdown = generated_skill
+
+        skill_name = target_skill if action_type == "edit" and target_skill else None
+        if not skill_name:
+            skill_name = self._skill_name_from_path(str(getattr(output, "skill_path", "") or ""))
+        if not skill_name:
+            skill_name = self._skill_name_from_path(generated_skill)
+        if not skill_name:
+            skill_name = self._skill_name_from_markdown(skill_markdown)
+        if not skill_name and self._is_valid_skill_name(generated_skill):
+            skill_name = generated_skill
+        if not skill_name or not self._is_valid_skill_name(skill_name):
+            _log("", f"  [WARN] Generator returned invalid skill name/path: {skill_name!r}")
+            return None
+        if not skill_markdown:
+            if generated_skill == skill_name:
+                skill_markdown = (
+                    "---\n"
+                    f"name: {skill_name}\n"
+                    f"description: {fallback_description}\n"
+                    "---\n\n"
+                    f"# {skill_name}\n\n"
+                    f"{str(getattr(output, 'reasoning', '') or fallback_description).strip()}\n"
+                )
+            else:
+                return None
+
+        skill_path = self._project_root / ".claude" / "skills" / skill_name / "SKILL.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        if not skill_markdown.endswith("\n"):
+            skill_markdown += "\n"
+        skill_path.write_text(skill_markdown)
+
+        from src.harness.opencode.skill_utils import ensure_skill_frontmatter
+
+        ensure_skill_frontmatter(
+            skill_path,
+            description=fallback_description,
+            compatibility=None,
+        )
+        return skill_name
+
+    @staticmethod
+    def _is_valid_skill_name(skill_name: str) -> bool:
+        import re
+
+        return bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", skill_name))
+
+    @staticmethod
+    def _skill_name_from_path(text: str) -> str | None:
+        import re
+
+        normalized = text.replace("\\", "/")
+        match = re.search(
+            r"(?:^|[`'\"( ])(?:\./)?\.claude/skills/([a-z0-9]+(?:-[a-z0-9]+)*)/SKILL\.md",
+            normalized,
+        )
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _skill_name_from_markdown(markdown: str) -> str | None:
+        import re
+
+        match = re.search(r"\A---\n(.*?)\n---", markdown, flags=re.DOTALL)
+        if not match:
+            return None
+        name_match = re.search(r"(?m)^name:\s*['\"]?([a-z0-9]+(?:-[a-z0-9]+)*)['\"]?\s*$", match.group(1))
+        return name_match.group(1) if name_match else None
+
     def _get_highest_iteration(self) -> int:
         """Find the highest iteration number across all iter-* branches.
 
@@ -938,16 +1164,24 @@ and modify it to add these capabilities. Preserve all existing content that is s
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _trajectory_failure_type(entry: tuple[Any, ...]) -> str:
+        return str(entry[5] or "").strip() if len(entry) > 5 else ""
+
+    @staticmethod
+    def _trajectory_failure_feedback(entry: tuple[Any, ...]) -> str:
+        return str(entry[6] or "").strip() if len(entry) > 6 else ""
+
+    @staticmethod
     def load_trajectories_from_dir(
         trajectories_dir: str | Path,
-    ) -> list[tuple[Any, str, str, str, str]]:
+    ) -> list[tuple[Any, ...]]:
         """Load pre-collected trajectories from a directory produced by collect_trajectories.py.
 
         Args:
             trajectories_dir: Directory containing ``trajectories.jsonl``.
 
         Returns:
-            List of (AgentTrace, question, agent_answer, ground_truth, category) tuples
+            List of (AgentTrace, question, agent_answer, ground_truth, category, failure_type[, failure_feedback]) tuples
             ready to pass as ``preloaded_trajectories`` to SelfImprovingLoop.__init__.
         """
         from src.schemas.trajectory import StoredTrajectory
@@ -977,8 +1211,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
     async def _collect_all_trajectories(
         self,
         all_data: list[tuple[str, str, str]],
-    ) -> list[tuple[AgentTrace, str, str, str, str]]:
-        """Run all samples concurrently and return (trace, question, agent_answer, ground_truth, category)."""
+    ) -> list[tuple[AgentTrace, str, str, str, str, str, str]]:
+        """Run all samples concurrently and return extended trajectory tuples."""
         traces = await asyncio.gather(*[
             self.agents.base.run(q) for q, _, _ in all_data
         ])
@@ -993,7 +1227,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 if trace.output and trace.output.final_answer
                 else "[PARSE FAILED]"
             )
-            result.append((trace, question, agent_answer, ground_truth, category))
+            result.append((trace, question, agent_answer, ground_truth, category, "", ""))
         return result
 
     def _get_all_skills_content(self) -> str:
@@ -1065,6 +1299,99 @@ and modify it to add these capabilities. Preserve all existing content that is s
         )
 
     @staticmethod
+    def _merge_scoring_failures(
+        parent_failures: list,
+        new_failures: list,
+        max_size: int = 40,
+    ) -> list:
+        """Merge parent's scoring failures with new batch, deduplicating by question.
+
+        New failures are added first (all of them, up to max_size) so the child's
+        improvement signal is never diluted.  Parent failures fill the remaining
+        slots up to max_size for regression coverage, capped at max_size // 2 so a
+        large parent history cannot crowd out the new batch.
+        """
+        seen: set[str] = set()
+        merged: list = []
+        # New batch first — always fully represented
+        for f in new_failures:
+            if len(merged) >= max_size:
+                break
+            q = f[1]  # question is index 1 in the 6-tuple
+            if q not in seen:
+                seen.add(q)
+                merged.append(f)
+        # Parent failures fill the rest for regression safety, capped at half max_size
+        parent_cap = min(max_size // 2, max_size - len(merged))
+        n_parent = 0
+        for f in parent_failures:
+            if n_parent >= parent_cap:
+                break
+            q = f[1]
+            if q not in seen:
+                seen.add(q)
+                merged.append(f)
+                n_parent += 1
+        return merged
+
+    def _sample_regression_successes(
+        self,
+        successes: list[tuple[Any, ...]],
+        categories: list[str],
+        count: int,
+    ) -> list[tuple[Any, ...]]:
+        """Sample already-passed trajectories for judge regression checks."""
+        if not successes or count <= 0:
+            return []
+
+        batch: list[tuple[Any, ...]] = []
+        seen: set[str] = set()
+        categories = categories or sorted({entry[4] for entry in successes})
+        if not categories:
+            categories = ["default"]
+
+        cat_idx = 0
+        attempts = 0
+        max_attempts = max(len(categories) * 2, count * 4)
+        while len(batch) < count and attempts < max_attempts:
+            cat = categories[cat_idx % len(categories)]
+            cat_successes = [entry for entry in successes if entry[4] == cat]
+            if cat_successes:
+                offset = self._per_cat_offset.get(f"regression:{cat}", 0)
+                entry = cat_successes[offset % len(cat_successes)]
+                self._per_cat_offset[f"regression:{cat}"] = offset + 1
+                question = entry[1]
+                if question not in seen:
+                    seen.add(question)
+                    batch.append(entry)
+            cat_idx += 1
+            attempts += 1
+
+        if len(batch) < count:
+            for entry in successes:
+                if len(batch) >= count:
+                    break
+                question = entry[1]
+                if question not in seen:
+                    seen.add(question)
+                    batch.append(entry)
+        return batch
+
+    @staticmethod
+    def _filter_bt_matches_for_active_players(
+        matches: list["BradleyTerryMatch"],
+        active_players: set[str],
+    ) -> list["BradleyTerryMatch"]:
+        """Return only matches where both player and opponent are active.
+
+        Active = currently in frontier, just generated, or an anchor.
+        Keeps the global bt_matches list intact for history; only the
+        filtered view is passed to the BT fitter so old discarded nodes
+        cannot shift ratings of current candidates.
+        """
+        return [m for m in matches if m.player in active_players and m.opponent in active_players]
+
+    @staticmethod
     def _summarize_skill_content(content: str, max_chars: int = 3500) -> str:
         """Build a compact judge-facing summary of available skills."""
         if not content.strip():
@@ -1109,6 +1436,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
         sdk = get_sdk()
         if sdk == "claude":
             return "anthropic", self.config.judge_model or "claude-haiku-4-5-20251001"
+        if sdk == "codex":
+            judge_model = self.config.judge_model
+            if judge_model and judge_model.startswith("openai/"):
+                judge_model = judge_model.split("/", 1)[1]
+            return "codex", judge_model or "gpt-5.1-codex-mini"
         if self.config.judge_model:
             judge_model = self.config.judge_model
             if judge_model.startswith("openai/"):
@@ -1139,6 +1471,65 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
     async def _call_judge_api(self, prompt: str, provider: str, model: str) -> str:
         """Make a direct (non-agent) completion call to the judge model."""
+        if provider == "codex":
+            from src.harness.codex import executor as codex_executor
+
+            schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "root_cause": {"type": "string"},
+                    "parent_hypothetical_action": {"type": "string"},
+                    "candidate_hypothetical_action": {"type": "string"},
+                    "hypothetical_action": {"type": "string"},
+                    "parent_success_prob": {"type": "number"},
+                    "candidate_success_prob": {"type": "number"},
+                    "relative_advantage": {"type": "number"},
+                    "match_score": {"type": "number"},
+                    "skill_addresses_root_cause": {"type": "number"},
+                    "probability_of_success": {"type": "number"},
+                    "would_succeed": {"type": "boolean"},
+                    "confidence": {"type": "number"},
+                    "remaining_blockers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "reasoning": {"type": "string"},
+                },
+                "required": [
+                    "root_cause",
+                    "parent_hypothetical_action",
+                    "candidate_hypothetical_action",
+                    "hypothetical_action",
+                    "parent_success_prob",
+                    "candidate_success_prob",
+                    "relative_advantage",
+                    "match_score",
+                    "skill_addresses_root_cause",
+                    "probability_of_success",
+                    "would_succeed",
+                    "confidence",
+                    "remaining_blockers",
+                    "reasoning",
+                ],
+            }
+            messages = await codex_executor.execute_query(
+                {
+                    "system": "",
+                    "model": model,
+                    "working_directory": str(self._project_root),
+                    "tools": [],
+                    "output_schema": schema,
+                },
+                prompt,
+            )
+            turn = messages[0]
+            self._record_judge_api_usage("codex", model, getattr(turn, "usage", None))
+            text = str(getattr(turn, "final_response", "") or "").strip()
+            if not text:
+                raise RuntimeError("Codex judge returned empty final_response")
+            return text
+
         from src.harness.provider_auth import ensure_provider_api_key
         api_key = ensure_provider_api_key(provider)
         if provider == "anthropic":
@@ -1354,6 +1745,21 @@ and modify it to add these capabilities. Preserve all existing content that is s
         return 0.5 - 0.5 * confidence
 
     @staticmethod
+    def _parse_judge_bool(value: Any, *, default: bool = False) -> bool:
+        """Parse judge booleans without treating non-empty strings as true."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "y", "1"}:
+                return True
+            if normalized in {"false", "no", "n", "0"}:
+                return False
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        return default
+
+    @staticmethod
     def _judge_probability_to_match_score(
         probability_of_success: Any,
         skill_addresses_root_cause: Any,
@@ -1362,6 +1768,90 @@ and modify it to add these capabilities. Preserve all existing content that is s
         p_success = SelfImprovingLoop._clamp01(probability_of_success, default=0.5)
         p_root = SelfImprovingLoop._clamp01(skill_addresses_root_cause, default=p_success)
         return max(0.0, min(1.0, 0.75 * p_success + 0.25 * p_root))
+
+    @staticmethod
+    def _judge_relative_to_match_score(
+        data: dict[str, Any],
+    ) -> tuple[float, float, float, float]:
+        """Convert A/B judge probabilities into a pairwise match score.
+
+        Returns (match_score, parent_prob, candidate_prob, relative_advantage).
+        ``match_score`` is centered on 0.5 so Bradley-Terry receives a true
+        pairwise comparison rather than an absolute candidate success estimate.
+        """
+        parent_prob = SelfImprovingLoop._clamp01(
+            data.get("parent_success_prob"),
+            default=0.5,
+        )
+        candidate_prob = SelfImprovingLoop._clamp01(
+            data.get("candidate_success_prob"),
+            default=SelfImprovingLoop._clamp01(
+                data.get("probability_of_success"),
+                default=0.5,
+            ),
+        )
+        if "relative_advantage" in data:
+            try:
+                relative_advantage = float(data.get("relative_advantage"))
+            except (TypeError, ValueError):
+                relative_advantage = candidate_prob - parent_prob
+        else:
+            relative_advantage = candidate_prob - parent_prob
+        relative_advantage = max(-1.0, min(1.0, relative_advantage))
+
+        if "match_score" in data:
+            match_score = SelfImprovingLoop._clamp01(data.get("match_score"), default=0.5)
+        else:
+            match_score = max(0.0, min(1.0, 0.5 + 0.5 * relative_advantage))
+        return match_score, parent_prob, candidate_prob, relative_advantage
+
+    @staticmethod
+    def _bt_player_uncertainty(
+        player: str,
+        matches: list[BradleyTerryMatch],
+        judge_results: dict[str, JudgeResult] | None = None,
+    ) -> float:
+        """Estimate uncertainty for a BT player in [0, 1].
+
+        Sparse comparisons and low judge confidence both increase uncertainty.
+        """
+        player_matches = [
+            match
+            for match in matches
+            if match.player == player or match.opponent == player
+        ]
+        n_matches = len(player_matches)
+        count_uncertainty = 1.0 / math.sqrt(max(1, n_matches))
+
+        confidence_uncertainty = 0.0
+        if judge_results and player in judge_results:
+            confidences = [
+                match.confidence
+                for match in judge_results[player].matches
+                if match.valid
+            ]
+            if confidences:
+                confidence_uncertainty = 1.0 - (
+                    sum(confidences) / len(confidences)
+                )
+
+        return max(count_uncertainty, confidence_uncertainty)
+
+    def _rating_to_score_with_uncertainty(
+        self,
+        rating: float,
+        anchor_rating: float,
+        base_score: float,
+        scale: float,
+        uncertainty: float,
+    ) -> float:
+        """Map BT rating to score and subtract a configurable uncertainty penalty."""
+        raw_score = self._rating_to_score(rating, anchor_rating, base_score, scale)
+        penalty = max(0.0, self.config.judge_bt_uncertainty_penalty) * max(
+            0.0,
+            min(1.0, uncertainty),
+        )
+        return max(0.0, min(1.0, raw_score - penalty))
 
     def _proposal_policy_prior(self, proposer_confidence: float | None = None) -> float:
         """Return a judge-independent policy prior for PUCT expansion.
@@ -1378,7 +1868,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
         root = ProgramSearchNode(
             name="base",
             parent=None,
-            prior=max(0.05, base_score),
+            prior=1.0,  # policy prior for root: maximum, decoupled from value (score)
             score=base_score,
             visit_count=1,
             total_q=base_score,
@@ -1460,19 +1950,53 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
     def _sample_proposal_failures(
         self,
-        failures: list[tuple[AgentTrace, str, str, str, str]],
+        failures: list[tuple[Any, ...]],
         categories: list[str],
-    ) -> list[tuple[AgentTrace, str, str, str, str]]:
-        """Sample a rotating category-aware batch for proposal generation."""
+        failure_types: list[str] | None = None,
+    ) -> list[tuple[Any, ...]]:
+        """Sample a rotating batch for proposal generation.
+
+        When failure_type labels are available (non-empty strings), sample
+        within a single failure_type so the Proposer sees a homogeneous batch
+        with the same root cause.  Falls back to category-based round-robin
+        when no failure_type labels exist.
+        """
         if not failures:
             return []
 
+        # --- failure_type-aware path ---
+        typed_failures = [f for f in failures if self._trajectory_failure_type(f)]
+        if failure_types and typed_failures:
+            types = failure_types
+            n_types = len(types)
+            ft_idx = self._category_offset % n_types
+            ft = types[ft_idx]
+            ft_failures = [
+                f for f in typed_failures if self._trajectory_failure_type(f) == ft
+            ]
+            # Advance even if empty so we don't keep retrying the same type
+            self._category_offset += 1
+            if ft_failures:
+                offset = self._per_failure_type_offset.get(ft, 0)
+                samples = min(
+                    self.config.samples_per_category * self.config.categories_per_batch,
+                    len(ft_failures),
+                )
+                batch = [
+                    ft_failures[(offset + k) % len(ft_failures)]
+                    for k in range(samples)
+                ]
+                self._per_failure_type_offset[ft] = offset + samples
+                return batch
+            # If the chosen type has no failures left, fall through to category path
+
+        # --- category-based path (fallback / no failure_type labels) ---
         n_cats = len(categories)
         if n_cats == 0:
             return failures[: self.config.samples_per_category]
 
         n_cats_this_iter = min(self.config.categories_per_batch, n_cats)
-        batch: list[tuple[AgentTrace, str, str, str, str]] = []
+        batch: list[tuple[Any, ...]] = []
         for j in range(n_cats_this_iter):
             cat_idx = (self._category_offset + j) % n_cats
             cat = categories[cat_idx]
@@ -1562,13 +2086,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
     async def _judge_skill_with_llm(
         self,
-        failures_ext: list[tuple[AgentTrace, str, str, str, str]],
+        failures_ext: list[tuple[Any, ...]],
         provider: str,
         model: str,
         child_name: str = "candidate",
         parent_name: str = "parent",
         proposal: str = "",
         justification: str = "",
+        proposer_root_cause_analysis: str = "",
+        proposer_coverage_plan: str = "",
+        proposer_regression_risks: str = "",
         parent_skill_summary: str = "",
         candidate_skill_summary: str = "",
         skill_diff: str = "",
@@ -1587,7 +2114,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
         scale = self.config.judge_elo_scale
         k_factor = self.config.judge_elo_k
 
-        async def judge_one(index: int, trace: AgentTrace, question: str, agent_answer: str, ground_truth: str, category: str) -> dict[str, Any]:
+        async def judge_one(
+            index: int,
+            trace: AgentTrace,
+            question: str,
+            agent_answer: str,
+            ground_truth: str,
+            category: str,
+            case_type: str,
+            case_feedback: str,
+        ) -> dict[str, Any]:
             async with semaphore:
                 trace_summary = trace.summarize(head_chars=3000, tail_chars=1500)
                 prompt = build_judge_query(
@@ -1598,9 +2134,14 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     skills_content,
                     proposal=proposal,
                     justification=justification,
+                    proposer_root_cause_analysis=proposer_root_cause_analysis,
+                    proposer_coverage_plan=proposer_coverage_plan,
+                    proposer_regression_risks=proposer_regression_risks,
                     parent_skill_summary=parent_skill_summary,
                     candidate_skill_summary=candidate_skill_summary,
                     skill_diff=skill_diff,
+                    case_type=case_type,
+                    case_feedback=case_feedback,
                 )
                 try:
                     text = await self._call_judge_api(prompt, provider, model)
@@ -1612,14 +2153,18 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     data = json.loads(text)
                     data["_raw_response"] = text
                     data["_index"] = index
-                    data["_category"] = category
+                    data["_category"] = (
+                        f"{category}:regression" if case_type == "regression" else category
+                    )
                     return data
                 except Exception as e:
                     _log("WARN", f"  Judge call failed ({type(e).__name__}): {e}")
                     return {
                         "_raw_response": "",
                         "_index": index,
-                        "_category": category,
+                        "_category": (
+                            f"{category}:regression" if case_type == "regression" else category
+                        ),
                         "would_succeed": False,
                         "confidence": 0.0,
                         "hypothetical_action": "",
@@ -1627,10 +2172,19 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         "_valid": False,
                     }
 
-        raw_results = await asyncio.gather(*[
-            judge_one(i, t, q, ans, gt, cat)
-            for i, (t, q, ans, gt, cat) in enumerate(failures_ext, start=1)
-        ])
+        raw_results = []
+        judge_tasks = []
+        for i, entry in enumerate(failures_ext, start=1):
+            t, q, ans, gt, cat = entry[:5]
+            failure_type = self._trajectory_failure_type(entry)
+            feedback = self._trajectory_failure_feedback(entry)
+            case_type = "regression" if failure_type == "regression_pass" else "failure"
+            judge_tasks.append(judge_one(i, t, q, ans, gt, cat, case_type, feedback))
+        raw_results = await asyncio.gather(*judge_tasks)
+        # Anchor ratings: all expected_before values are computed from the same
+        # starting point so match ordering has no effect on the final rating.
+        _initial_child_rating = child_rating
+        _initial_opponent_rating = opponent_rating
 
         matches: list[JudgeMatchResult] = []
         direct_scores: list[float] = []
@@ -1664,23 +2218,52 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 continue
 
             confidence = self._clamp01(data.get("confidence"), default=0.5)
-            would_succeed = bool(data.get("would_succeed"))
-            has_probability_score = (
+            would_succeed = self._parse_judge_bool(
+                data.get("would_succeed"),
+                default=False,
+            )
+            has_relative_score = (
+                "match_score" in data
+                or "parent_success_prob" in data
+                or "candidate_success_prob" in data
+                or "relative_advantage" in data
+            )
+            parent_success_prob = 0.0
+            candidate_success_prob = 0.0
+            relative_advantage = 0.0
+            if has_relative_score:
+                (
+                    match_score,
+                    parent_success_prob,
+                    candidate_success_prob,
+                    relative_advantage,
+                ) = self._judge_relative_to_match_score(data)
+            elif (
                 "probability_of_success" in data
                 or "skill_addresses_root_cause" in data
-            )
-            if has_probability_score:
+            ):
                 match_score = self._judge_probability_to_match_score(
                     data.get("probability_of_success"),
                     data.get("skill_addresses_root_cause"),
                 )
-                would_succeed = match_score >= 0.5
+                candidate_success_prob = self._clamp01(
+                    data.get("probability_of_success"),
+                    default=match_score,
+                )
+                parent_success_prob = 0.5
+                relative_advantage = 2.0 * (match_score - 0.5)
             elif self.config.judge_scoring == "average":
                 match_score = confidence if would_succeed else 0.0
+                candidate_success_prob = match_score
+                parent_success_prob = 0.5
+                relative_advantage = 2.0 * (match_score - 0.5)
             else:
                 match_score = self._judge_binary_to_match_score(would_succeed, confidence)
+                candidate_success_prob = match_score
+                parent_success_prob = 0.5
+                relative_advantage = 2.0 * (match_score - 0.5)
 
-            expected_before = self._elo_expected(child_rating, opponent_rating, scale)
+            expected_before = self._elo_expected(_initial_child_rating, _initial_opponent_rating, scale)
             child_rating += k_factor * (match_score - expected_before)
             opponent_expected = 1.0 - expected_before
             opponent_rating += k_factor * ((1.0 - match_score) - opponent_expected)
@@ -1695,7 +2278,10 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 expected_before=expected_before,
                 child_rating_after=child_rating,
                 opponent_rating_after=opponent_rating,
-                hypothetical_action=str(data.get("hypothetical_action", "")),
+                hypothetical_action=str(
+                    data.get("candidate_hypothetical_action")
+                    or data.get("hypothetical_action", "")
+                ),
                 reasoning=str(data.get("reasoning", "")),
                 raw_response=str(data.get("_raw_response", "")),
                 valid=True,
@@ -1706,8 +2292,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 ),
                 probability_of_success=self._clamp01(
                     data.get("probability_of_success"),
-                    default=match_score,
+                    default=candidate_success_prob,
                 ),
+                parent_success_prob=parent_success_prob,
+                candidate_success_prob=candidate_success_prob,
+                relative_advantage=relative_advantage,
                 remaining_blockers=[
                     str(item) for item in data.get("remaining_blockers", [])[:5]
                 ]
@@ -1725,7 +2314,10 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         f"expected={result.expected_before:.3f} "
                         f"rating={result.child_rating_after:.1f}/{result.opponent_rating_after:.1f} "
                         f"would_succeed={result.would_succeed} confidence={result.confidence:.3f} "
-                        f"p_success={result.probability_of_success:.3f} "
+                        f"score_pass={result.match_score >= 0.5} "
+                        f"p_parent={result.parent_success_prob:.3f} "
+                        f"p_candidate={result.candidate_success_prob:.3f} "
+                        f"rel_adv={result.relative_advantage:.3f} "
                         f"root_fit={result.skill_addresses_root_cause:.3f}"
                     ),
                 )
@@ -1749,6 +2341,14 @@ and modify it to add these capabilities. Preserve all existing content that is s
             # Equal Elo means "no evidence of recovery over the failed baseline";
             # only rating above the opponent contributes to estimated recovery.
             estimated_fix_rate = max(0.0, min(1.0, 2.0 * (expected_win_rate - 0.5)))
+        valid_confidences = [match.confidence for match in matches if match.valid]
+        count_uncertainty = 1.0 / math.sqrt(max(1, len(direct_scores)))
+        confidence_uncertainty = (
+            1.0 - (sum(valid_confidences) / len(valid_confidences))
+            if valid_confidences
+            else 1.0
+        )
+        uncertainty = max(count_uncertainty, confidence_uncertainty)
 
         return JudgeResult(
             estimated_fix_rate=estimated_fix_rate,
@@ -1757,6 +2357,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
             opponent_rating=opponent_rating,
             expected_win_rate=expected_win_rate,
             matches=matches,
+            uncertainty=uncertainty,
         )
 
     async def _run_with_llm_judge(self) -> LoopResult:
@@ -1808,14 +2409,48 @@ and modify it to add these capabilities. Preserve all existing content that is s
             _log("COST", f"Trajectory collection: ${self._iter_cost:.4f} | {self._format_cost_breakdown()}")
 
         # 3. Compute base score and partition failures
-        all_failures_ext: list[tuple[AgentTrace, str, str, str, str]] = []
+        all_failures_ext: list[tuple[Any, ...]] = []
+        all_successes_ext: list[tuple[Any, ...]] = []
         passed = 0
-        for trace, question, agent_answer, ground_truth, category in extended_traces:
+        for entry in extended_traces:
+            trace, question, agent_answer, ground_truth, category = entry[:5]
+            failure_type = self._trajectory_failure_type(entry)
+            failure_feedback = self._trajectory_failure_feedback(entry)
             score = self.scorer(question, agent_answer.strip().lower(), ground_truth.strip().lower())
-            if score >= 0.8:
+            if score >= self.config.failure_threshold:
                 passed += 1
+                all_successes_ext.append((
+                    trace,
+                    question,
+                    agent_answer,
+                    ground_truth,
+                    category,
+                    "regression_pass",
+                    build_regression_success_feedback(
+                        question,
+                        agent_answer,
+                        ground_truth,
+                        domain_hints=self.config.error_surface_hints,
+                    ),
+                ))
             else:
-                all_failures_ext.append((trace, question, agent_answer, ground_truth, category))
+                if not failure_feedback:
+                    failure_feedback = build_answer_comparison_feedback(
+                        question,
+                        agent_answer,
+                        ground_truth,
+                        failure_type,
+                        domain_hints=self.config.error_surface_hints,
+                    )
+                all_failures_ext.append((
+                    trace,
+                    question,
+                    agent_answer,
+                    ground_truth,
+                    category,
+                    failure_type,
+                    failure_feedback,
+                ))
 
         total = len(extended_traces)
         base_score = passed / total if total > 0 else 0.0
@@ -1829,6 +2464,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
         search_root = self._build_program_search_tree(base_score)
         bt_matches: list[BradleyTerryMatch] = []
         bt_players: set[str] = {"base"}
+        bt_player_judge_results: dict[str, JudgeResult] = {}
         bt_ratings: dict[str, float] = {
             "base": self.config.judge_elo_initial_rating,
         }
@@ -1846,13 +2482,25 @@ and modify it to add these capabilities. Preserve all existing content that is s
         _log("JUDGE", f"Judge: {judge_provider} / {judge_model}")
         if self.config.judge_scoring == "bradley_terry":
             _log("JUDGE", "Scoring: global Bradley-Terry league over all generated nodes")
+            _log(
+                "JUDGE",
+                f"BT uncertainty penalty: {self.config.judge_bt_uncertainty_penalty:.3f}",
+            )
 
         # 4. Evolution loop
         # Categories come from trajectories when preloaded, else from train_pools
         if self._preloaded_trajectories is not None:
             categories = sorted({entry[4] for entry in extended_traces})
+            failure_types = sorted(
+                {
+                    self._trajectory_failure_type(entry)
+                    for entry in extended_traces
+                    if self._trajectory_failure_type(entry)
+                }
+            )
         else:
             categories = sorted(self.train_pools.keys())
+            failure_types = []
         n_cats = len(categories)
         no_improvement_count = 0
         iteration_count = 0
@@ -1877,21 +2525,65 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
             parent_score = parent_node.score
             parent_skills_content = self._get_all_skills_content()
+            # Capture best frontier score before this iteration to detect genuine improvement.
+            _frontier_before = self.manager.get_frontier_with_scores()
+            best_score_before_iter = _frontier_before[0][1] if _frontier_before else base_score
 
             if not all_failures_ext:
                 _log("", "  -> No failures remaining")
                 break
 
-            batch_failures_ext = self._sample_proposal_failures(all_failures_ext, categories)
-            scoring_failures_ext = batch_failures_ext
+            batch_failures_ext = self._sample_proposal_failures(
+                all_failures_ext, categories, failure_types
+            )
+            # Inherit parent's scoring failures so the child is always evaluated
+            # on a superset of the failures the parent was scored on.  This makes
+            # child_score vs parent_score a fair comparison (same evaluation set).
+            scoring_failures_ext = self._merge_scoring_failures(
+                [
+                    entry
+                    for entry in parent_node.scoring_failures
+                    if self._trajectory_failure_type(entry) != "regression_pass"
+                ],
+                batch_failures_ext,
+                max_size=self.config.samples_per_category * self.config.categories_per_batch * 3,
+            )
+            regression_cases_ext = self._sample_regression_successes(
+                all_successes_ext,
+                categories,
+                count=max(1, len(batch_failures_ext)),
+            )
+            regression_questions = {entry[1] for entry in regression_cases_ext}
+            scoring_cases_ext = [
+                entry
+                for entry in scoring_failures_ext
+                if entry[1] not in regression_questions
+            ] + regression_cases_ext
 
-            # Convert to legacy format (trace, agent_answer, ground_truth, category) for _mutate
-            batch_failures = [(t, ans, gt, cat) for t, _q, ans, gt, cat in batch_failures_ext]
+            # Convert to legacy 4-tuple format for _mutate; keep questions separately
+            # so the proposer sees the full question text alongside the trace.
+            proposal_questions = [f[1] for f in batch_failures_ext]
+            batch_failures = []
+            for failure_entry in batch_failures_ext:
+                t, q, ans, gt, cat = failure_entry[:5]
+                ft = self._trajectory_failure_type(failure_entry)
+                feedback = self._trajectory_failure_feedback(failure_entry)
+                if not feedback:
+                    feedback = build_answer_comparison_feedback(
+                        q, ans, gt, ft,
+                        domain_hints=self.config.error_surface_hints,
+                    )
+                batch_failures.append((t, ans, gt, cat, feedback))
+            parent_questions = {f[1] for f in parent_node.scoring_failures}
+            n_new = sum(1 for f in scoring_failures_ext if f[1] not in parent_questions)
+            n_inherited = len(scoring_failures_ext) - n_new
             _log(
                 "",
                 (
                     f"  Using {len(batch_failures)} proposal failures; "
-                    f"judging on {len(scoring_failures_ext)} failures..."
+                    f"judging on {len(scoring_failures_ext)} failure cases "
+                    f"({n_inherited} inherited from parent + {n_new} new) "
+                    f"+ {len(regression_cases_ext)} regression cases..."
                 ),
             )
 
@@ -1913,7 +2605,6 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     f"candidate(s) from {parent}"
                 ),
             )
-            any_child_added = False
             any_child_created = False
             sibling_proposals: list[str] = []
 
@@ -1935,6 +2626,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     batch_failures,
                     child_iteration_id,
                     diversity_hint=diversity_hint,
+                    questions=proposal_questions,
                 )
 
                 if mutation_result is None:
@@ -1942,7 +2634,10 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     continue
 
                 any_child_created = True
-                child_name, proposal, justification, proposer_confidence = mutation_result
+                child_name = mutation_result.child_name
+                proposal = mutation_result.proposal
+                justification = mutation_result.justification
+                proposer_confidence = mutation_result.proposer_confidence
                 sibling_proposals.append(proposal)
                 candidate_skills_content = self._get_all_skills_content()
                 parent_skill_summary = self._summarize_skill_content(parent_skills_content)
@@ -1951,19 +2646,26 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
                 # Judge with LLM — no full agent re-run
                 _log("", f"  -> Judging {child_name} via LLM ({judge_provider}/{judge_model})...")
-                judge_result = await self._judge_skill_with_llm(
-                    scoring_failures_ext,
-                    judge_provider,
-                    judge_model,
-                    child_name=child_name,
-                    parent_name=parent,
-                    proposal=proposal,
-                    justification=justification,
-                    parent_skill_summary=parent_skill_summary,
-                    candidate_skill_summary=candidate_skill_summary,
-                    skill_diff=skill_diff,
-                    candidate_skills_content=candidate_skills_content,
-                )
+                try:
+                    judge_result = await self._judge_skill_with_llm(
+                        scoring_cases_ext,
+                        judge_provider,
+                        judge_model,
+                        child_name=child_name,
+                        parent_name=parent,
+                        proposal=proposal,
+                        justification=justification,
+                        proposer_root_cause_analysis=mutation_result.root_cause_analysis,
+                        proposer_coverage_plan=mutation_result.coverage_plan,
+                        proposer_regression_risks=mutation_result.regression_risks,
+                        parent_skill_summary=parent_skill_summary,
+                        candidate_skill_summary=candidate_skill_summary,
+                        skill_diff=skill_diff,
+                        candidate_skills_content=candidate_skills_content,
+                    )
+                except RuntimeError as e:
+                    _log("WARN", f"  [WARN] All judge calls failed for {child_name}: {e}; skipping child")
+                    continue
 
                 # Estimate total score: Elo-estimated fix rate is the fraction of
                 # failed samples the child is expected to recover. Scale it to the
@@ -1985,22 +2687,30 @@ and modify it to add these capabilities. Preserve all existing content that is s
                             candidate_skills_content,
                         )
                         _log("", f"  -> Anchor judging {child_name} vs {anchor}...")
-                        anchor_result = await self._judge_skill_with_llm(
-                            scoring_failures_ext,
-                            judge_provider,
-                            judge_model,
-                            child_name=child_name,
-                            parent_name=anchor,
-                            proposal=proposal,
-                            justification=justification,
-                            parent_skill_summary=anchor_skill_summary,
-                            candidate_skill_summary=candidate_skill_summary,
-                            skill_diff=anchor_diff,
-                            candidate_skills_content=candidate_skills_content,
-                        )
+                        try:
+                            anchor_result = await self._judge_skill_with_llm(
+                                scoring_cases_ext,
+                                judge_provider,
+                                judge_model,
+                                child_name=child_name,
+                                parent_name=anchor,
+                                proposal=proposal,
+                                justification=justification,
+                                proposer_root_cause_analysis=mutation_result.root_cause_analysis,
+                                proposer_coverage_plan=mutation_result.coverage_plan,
+                                proposer_regression_risks=mutation_result.regression_risks,
+                                parent_skill_summary=anchor_skill_summary,
+                                candidate_skill_summary=candidate_skill_summary,
+                                skill_diff=anchor_diff,
+                                candidate_skills_content=candidate_skills_content,
+                            )
+                        except RuntimeError as e:
+                            _log("WARN", f"  [WARN] Anchor judge failed ({child_name} vs {anchor}): {e}; skipping anchor")
+                            continue
                         anchor_results.append((anchor, anchor_result))
 
                     bt_players.update({child_name, *anchors})
+                    bt_player_judge_results[child_name] = judge_result
                     new_bt_matches = [
                         BradleyTerryMatch(
                             player=child_name,
@@ -2014,39 +2724,74 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         if match.valid
                     ]
                     bt_matches.extend(new_bt_matches)
+                    # Only fit over matches where both sides are currently
+                    # active (frontier + new child + anchors).  Old discarded
+                    # nodes stay in bt_matches for history but must not shift
+                    # ratings of present candidates.
+                    _active_players = (
+                        {"base", child_name}
+                        | {n for n, _ in self.manager.get_frontier_with_scores()}
+                        | set(anchors)
+                    )
+                    _active_bt_matches = self._filter_bt_matches_for_active_players(
+                        bt_matches, _active_players
+                    )
                     bt_ratings = self._fit_bradley_terry_ratings(
-                        bt_matches,
-                        sorted(bt_players),
+                        _active_bt_matches,
+                        sorted(_active_players),
                         anchor="base",
                         initial_rating=self.config.judge_elo_initial_rating,
                         scale=self.config.judge_elo_scale,
                     )
                     base_rating = bt_ratings.get("base", self.config.judge_elo_initial_rating)
                     child_rating = bt_ratings.get(child_name, self.config.judge_elo_initial_rating)
-                    child_score = self._rating_to_score(
+                    child_uncertainty = self._bt_player_uncertainty(
+                        child_name,
+                        _active_bt_matches,
+                        bt_player_judge_results,
+                    )
+                    child_raw_score = self._rating_to_score(
                         child_rating,
                         base_rating,
                         base_score,
                         self.config.judge_elo_scale,
                     )
+                    child_score = self._rating_to_score_with_uncertainty(
+                        child_rating,
+                        base_rating,
+                        base_score,
+                        self.config.judge_elo_scale,
+                        child_uncertainty,
+                    )
+                    # Only update the frontier for the new child and nodes already in the
+                    # frontier. Updating all BT-rated nodes would re-admit previously
+                    # excluded programs whose relative rating rose due to new competitors.
+                    existing_frontier_names = {name for name, _ in self.manager.get_frontier_with_scores()}
                     for rated_name, rating in bt_ratings.items():
-                        if rated_name not in bt_players:
+                        if rated_name not in _active_players:
                             continue
                         rated_score = (
                             base_score
                             if rated_name == "base"
-                            else self._rating_to_score(
+                            else self._rating_to_score_with_uncertainty(
                                 rating,
                                 base_rating,
                                 base_score,
                                 self.config.judge_elo_scale,
+                                self._bt_player_uncertainty(
+                                    rated_name,
+                                    _active_bt_matches,
+                                    bt_player_judge_results,
+                                ),
                             )
                         )
-                        self.manager.update_frontier(
-                            rated_name,
-                            rated_score,
-                            max_size=self.config.frontier_size,
-                        )
+                        if rated_name == child_name or rated_name in existing_frontier_names:
+                            self.manager.update_frontier(
+                                rated_name,
+                                rated_score,
+                                max_size=self.config.frontier_size,
+                            )
+                        # Always sync PUCT node scores for accurate tree navigation.
                         self._update_puct_node_score(search_root, rated_name, rated_score)
 
                     expected_win = self._elo_expected(
@@ -2054,14 +2799,21 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         base_rating,
                         self.config.judge_elo_scale,
                     )
+                    avg_new_match = (
+                        sum(m.score for m in new_bt_matches) / len(new_bt_matches)
+                        if new_bt_matches
+                        else 0.5
+                    )
                     _log(
                         "",
                         (
                             f"  -> Judge BT: global_rating={child_rating:.1f} "
                             f"base_rating={base_rating:.1f}, expected_vs_base={expected_win:.3f}, "
-                            f"avg_match={sum(m.score for m in new_bt_matches) / len(new_bt_matches):.3f} "
+                            f"avg_match={avg_new_match:.3f} "
                             f"matches={len(new_bt_matches)} anchors={len(anchors)} "
-                            f"→ global score {child_score:.4f}"
+                            f"uncertainty={child_uncertainty:.3f} "
+                            f"raw_score={child_raw_score:.4f} "
+                            f"→ penalized score {child_score:.4f}"
                         ),
                     )
                 else:
@@ -2082,18 +2834,25 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 if added:
                     outcome = "improved" if child_score > parent_score else "kept"
                     _log("", f"  [OK] Added to frontier (score: {child_score:.4f})")
-                    any_child_added = True
                 else:
                     outcome = "not_frontier"
                     _log("", f"  [SKIP] Not added to frontier (score: {child_score:.4f}); kept for PUCT exploration")
 
+                # Mark node as discarded when it scores clearly below base so PUCT
+                # stops revisiting a dead branch.
+                is_discarded = child_score < base_score - 0.05
                 child_node = self._add_puct_child(
                     parent_node,
                     child_name,
                     child_score,
                     prior=self._proposal_policy_prior(proposer_confidence),
-                    discarded=False,
+                    discarded=is_discarded,
                 )
+                # Record which failures this child was scored on so its own
+                # children will inherit them and comparisons remain consistent.
+                child_node.scoring_failures = scoring_cases_ext
+                if is_discarded:
+                    _log("PUCT", f"Marked {child_name} as discarded (score {child_score:.4f} < base {base_score:.4f} - 0.05)")
                 _log(
                     "PUCT",
                     (
@@ -2123,7 +2882,9 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     active_skills=self._get_active_skills(),
                 )
 
-            if any_child_added:
+            _frontier_after = self.manager.get_frontier_with_scores()
+            best_score_after_iter = _frontier_after[0][1] if _frontier_after else base_score
+            if best_score_after_iter > best_score_before_iter:
                 no_improvement_count = 0
             elif any_child_created:
                 no_improvement_count += 1

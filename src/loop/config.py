@@ -86,6 +86,10 @@ class LoopConfig:
     judge_elo_initial_rating: float = 1500.0
     judge_elo_k: float = 128.0
     judge_elo_scale: float = 400.0
+    # Penalize Bradley-Terry scores for sparse/low-confidence evidence. This
+    # keeps frontier selection from over-trusting nodes with only a few judged
+    # comparisons or uncertain judge outputs.
+    judge_bt_uncertainty_penalty: float = 0.05
     judge_log_details: bool = True
     # Optional direct-judge price overrides in USD per 1M tokens. Direct API
     # responses expose token usage but not provider billing; when these are not
@@ -98,3 +102,15 @@ class LoopConfig:
     puct_children_per_node: int = 2
     children_per_iteration: int = 2
     puct_default_prior: float = 0.5
+
+    # Failure detection threshold used in standard (non-judge) mode.
+    # A sample with score below this value is treated as a failure and
+    # forwarded to the proposer.  Decoupled from tolerance so both can
+    # be tuned independently.
+    failure_threshold: float = 0.8
+
+    # Domain-specific keyword→surface mapping for answer-comparison feedback.
+    # Keys are surface-description strings; values are lists of question
+    # keywords that trigger them.  None → use the built-in defaults defined
+    # in helpers._DEFAULT_ERROR_SURFACE_HINTS.
+    error_surface_hints: dict | None = None

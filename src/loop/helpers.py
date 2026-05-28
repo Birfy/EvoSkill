@@ -1,7 +1,8 @@
 """Helper functions for the self-improving loop."""
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+import re
 
 from src.harness.opencode.skill_utils import (
     ensure_skill_frontmatter,
@@ -14,13 +15,15 @@ if TYPE_CHECKING:
 
 
 def build_proposer_query(
-    traces_with_answers: list[tuple["AgentTrace", str, str, str]],
+    traces_with_answers: list[tuple[Any, ...]],
     feedback_history: str,
     evolution_mode: str = "skill_only",
     truncation_level: int = 0,
     task_constraints: str = "",
     project_root: str | Path | None = None,
     diversity_hint: str = "",
+    questions: list[str] | None = None,
+    domain_hints: dict[str, list[str]] | None = None,
 ) -> str:
     """Build the query for the proposer agent from multiple failure traces.
 
@@ -65,12 +68,14 @@ def build_proposer_query(
     skills_list = "\n".join([f"- {s}" for s in existing_skills]) or "None"
 
     # Collect categories for summary
-    categories = [cat for _, _, _, cat in traces_with_answers]
+    categories = [failure[3] for failure in traces_with_answers if len(failure) > 3]
     category_summary = ", ".join(sorted(set(categories)))
 
     # Build failure summaries with truncation-level-aware settings
     failure_sections = []
-    for i, (trace, agent_answer, ground_truth, category) in enumerate(traces_with_answers, 1):
+    for i, failure in enumerate(traces_with_answers, 1):
+        trace, agent_answer, ground_truth, category = failure[:4]
+        feedback = str(failure[4] or "").strip() if len(failure) > 4 else ""
         # For prompt mode, use more aggressive truncation to focus on patterns
         # For skill mode, keep full trace to see tool usage (but respect truncation level)
         if evolution_mode == "prompt_only":
@@ -83,11 +88,23 @@ def build_proposer_query(
 
         trace_summary = trace.summarize(head_chars=effective_head, tail_chars=effective_tail)
 
-        failure_sections.append(f"""### Failure {i} [Category: {category}]
+        question_line = f"\nQuestion: {questions[i - 1]}" if questions and i - 1 < len(questions) else ""
+        if not feedback:
+            feedback = build_answer_comparison_feedback(
+                questions[i - 1] if questions and i - 1 < len(questions) else "",
+                str(agent_answer),
+                str(ground_truth),
+                domain_hints=domain_hints,
+            )
+
+        feedback_section = f"\nStructured Failure Feedback:\n{feedback}\n" if feedback else ""
+
+        failure_sections.append(f"""### Failure {i} [Category: {category}]{question_line}
 {trace_summary}
 
 Agent Answer: {agent_answer}
 Ground Truth: {ground_truth}
+{feedback_section}
 """)
 
     failures_text = "\n".join(failure_sections)
@@ -98,9 +115,21 @@ Ground Truth: {ground_truth}
         if diversity_hint.strip()
         else ""
     )
+    existing_skill_rule = (
+        "There are no existing project skills. You MUST propose action=\"create\" "
+        "and leave target_skill null/empty. Do not edit or reference non-project "
+        "skills such as brainstorming or framework/system skills."
+        if not existing_skills
+        else (
+            "You may propose action=\"edit\" only for one of the exact skill names "
+            "listed above. If no listed skill directly applies, propose action=\"create\"."
+        )
+    )
 
     return f"""## Existing Skills (check before proposing new ones)
 {skills_list}
+
+Existing skill rule: {existing_skill_rule}
 {constraints_section}
 {diversity_section}
 ## Previous Attempts Feedback
@@ -113,11 +142,202 @@ Analyze the patterns across these failures to identify a GENERAL improvement, no
 {failures_text}
 
 ## Your Task
-1. Check if any EXISTING skill should have handled these failures
-2. If yes → propose EDITING that skill (action="edit", target_skill="skill-name")
-3. If no → propose a NEW skill (action="create")
-4. Reference any related DISCARDED iterations and explain how your proposal differs
-5. Identify what COMMON pattern or capability gap caused these failures across categories"""
+1. Build a per-failure root-cause matrix before choosing a proposal.
+   - For each failure, identify the earliest divergent source/table/row/column/formula/unit/rounding step.
+   - Use the provided predicted-vs-expected comparison to locate the first wrong intermediate, not just the final answer.
+2. Identify the shared reusable capability gap, but keep distinct failure modes separate.
+   - Do not hide uncovered cases behind a generic "verify more carefully" proposal.
+   - If one sampled failure is not covered by your proposal, say that explicitly in coverage_plan.
+3. Check if any EXISTING skill should have handled these failures.
+4. If yes → propose EDITING that listed project skill only (action="edit", target_skill="skill-name").
+5. If no → propose a NEW skill (action="create").
+6. Reference any related DISCARDED iterations and explain how your proposal differs.
+7. Include regression-risk analysis: how this proposal could degrade previously correct tasks, and what guard prevents that.
+8. Fill root_cause_analysis, coverage_plan, and regression_risks with concrete details."""
+
+
+_DEFAULT_ERROR_SURFACE_HINTS: dict[str, list[str]] = {
+    "statistic definition, population/sample basis, complete time-point subset, rounding": [
+        "standard deviation", "variance", "mean", "average",
+    ],
+    "explicit category set, inequality strictness, per-period count then aggregation": [
+        "how many", "categories", "threshold", "more than", "less than", "at least",
+    ],
+    "contributor inclusion/exclusion, rollup overlap, missing/extra rows, unit scale": [
+        "sum", "total", "aggregate",
+    ],
+    "semantic row-label grounding and correct group-by dimension": [
+        "labeled", "classified by", "first callable", "grouped by",
+    ],
+    "model feature/time index, predicted-vs-actual binding, absolute-difference formula": [
+        "ols", "predicted", "actual", "absolute difference", "model",
+    ],
+    "formula definition, period length, percent/fraction scaling, output vector order": [
+        "cagr", "elasticity", "decay", "growth rate", "logarithmic",
+    ],
+}
+
+
+def build_regression_success_feedback(
+    question: str,
+    agent_answer: str,
+    ground_truth: str,
+    domain_hints: dict[str, list[str]] | None = None,
+) -> str:
+    """Create specific feedback for a regression case where the agent succeeded.
+
+    Tells the judge which computation surfaces were handled correctly and must
+    be preserved by the candidate skill set.
+    """
+    pred_nums = _extract_numbers(agent_answer)
+    exp_nums = _extract_numbers(ground_truth)
+    lines = [
+        "- regression_case: trajectory already produced the correct answer",
+        f"- correct_answer: {agent_answer}",
+        f"- expected_answer: {ground_truth}",
+    ]
+    if pred_nums and exp_nums and pred_nums == exp_nums:
+        lines.append("- match_type: exact numeric match")
+    elif agent_answer.strip().lower() == ground_truth.strip().lower():
+        lines.append("- match_type: exact string match")
+    else:
+        lines.append("- match_type: tolerance/fuzzy match passed")
+
+    preserved = _likely_error_surfaces(
+        question.lower(), agent_answer, ground_truth, pred_nums, exp_nums,
+        domain_hints=domain_hints,
+    )
+    lines.append("- preserved_surfaces: " + "; ".join(preserved))
+    lines.append(
+        "- preservation_requirement: candidate skills must NOT alter the "
+        "source selection, operator, units, rounding, or aggregation method "
+        "used to reach this answer."
+    )
+    return "\n".join(lines)
+
+
+def build_answer_comparison_feedback(
+    question: str,
+    predicted: str,
+    expected: str,
+    failure_type: str = "",
+    domain_hints: dict[str, list[str]] | None = None,
+) -> str:
+    """Create structured, non-oracle comparison feedback for proposer prompts.
+
+    This does not invent hidden intermediate values.  It makes the known answer
+    delta explicit and lists the most likely verification surfaces the proposer
+    should inspect in the trajectory.
+    """
+    pred_nums = _extract_numbers(predicted)
+    exp_nums = _extract_numbers(expected)
+    q = question.lower()
+    lines = []
+    if failure_type:
+        lines.append(f"- failure_type: {failure_type}")
+    lines.append(f"- predicted_answer: {predicted}")
+    lines.append(f"- expected_answer: {expected}")
+
+    if pred_nums and exp_nums:
+        pairs = list(zip(pred_nums, exp_nums))
+        diffs = [p - e for p, e in pairs]
+        abs_diffs = [abs(d) for d in diffs]
+        ratios = [
+            (p / e)
+            for p, e in pairs
+            if e not in (0.0, -0.0)
+        ]
+        lines.append(
+            "- numeric_delta: "
+            + ", ".join(
+                f"pred[{idx}] - expected[{idx}] = {diff:.12g}"
+                for idx, diff in enumerate(diffs[:6])
+            )
+        )
+        if ratios:
+            lines.append(
+                "- numeric_ratio: "
+                + ", ".join(
+                    f"pred[{idx}] / expected[{idx}] = {ratio:.12g}"
+                    for idx, ratio in enumerate(ratios[:6])
+                )
+            )
+        lines.append(
+            "- mismatch_shape: "
+            + _numeric_mismatch_shape(abs_diffs, ratios, len(pred_nums), len(exp_nums))
+        )
+    else:
+        lines.append("- mismatch_shape: non_numeric_or_unparsed_answer_mismatch")
+
+    likely = _likely_error_surfaces(q, predicted, expected, pred_nums, exp_nums, domain_hints=domain_hints)
+    lines.append("- likely_error_surfaces: " + "; ".join(likely))
+    lines.append(
+        "- first_divergence_to_inspect: compare the trajectory's extracted rows/columns, "
+        "unit conversions, formula choice, aggregation set, and final rounding against the expected answer; "
+        "do not assume final-answer formatting is the root cause unless numeric values already match."
+    )
+    lines.append(
+        "- required_proposer_fix: propose a reusable verification gate that would force the agent "
+        "to expose and check the earliest divergent intermediate, not merely restate the final expected answer."
+    )
+    return "\n".join(lines)
+
+
+def _extract_numbers(text: str) -> list[float]:
+    nums: list[float] = []
+    normalized = text.replace(",", "").replace("−", "-")
+    for match in re.finditer(r"-?\d+(?:\.\d+)?", normalized):
+        try:
+            nums.append(float(match.group(0)))
+        except ValueError:
+            pass
+    return nums
+
+
+def _numeric_mismatch_shape(
+    abs_diffs: list[float],
+    ratios: list[float],
+    n_pred: int,
+    n_exp: int,
+) -> str:
+    labels: list[str] = []
+    if n_pred != n_exp:
+        labels.append(f"numeric_arity_mismatch(pred={n_pred}, expected={n_exp})")
+    if abs_diffs:
+        max_abs = max(abs_diffs)
+        labels.append(f"max_abs_delta={max_abs:.12g}")
+    if ratios:
+        max_ratio_gap = max(abs(r - 1.0) for r in ratios)
+        labels.append(f"max_relative_gap={max_ratio_gap:.6g}")
+        if any(abs(abs(r) - 10.0) < 0.5 or abs(abs(r) - 100.0) < 5.0 for r in ratios):
+            labels.append("possible_scale_factor_error")
+        elif max_ratio_gap < 0.02:
+            labels.append("close_numeric_mismatch")
+        elif max_ratio_gap > 0.5:
+            labels.append("large_numeric_mismatch")
+    return ", ".join(labels) if labels else "numeric_mismatch"
+
+
+def _likely_error_surfaces(
+    question_lc: str,
+    predicted: str,
+    expected: str,
+    pred_nums: list[float],
+    exp_nums: list[float],
+    domain_hints: dict[str, list[str]] | None = None,
+) -> list[str]:
+    surfaces: list[str] = []
+    hints = domain_hints if domain_hints is not None else _DEFAULT_ERROR_SURFACE_HINTS
+    for surface, keywords in hints.items():
+        if any(kw in question_lc for kw in keywords):
+            surfaces.append(surface)
+    if pred_nums and exp_nums and len(pred_nums) == len(exp_nums):
+        deltas = [abs(p - e) for p, e in zip(pred_nums, exp_nums)]
+        if deltas and max(deltas) <= 1.0:
+            surfaces.append("small numeric drift: rounding stage, interpolation method, boundary value")
+    if not surfaces:
+        surfaces.append("answer parsing/formatting or unclassified semantic mismatch")
+    return surfaces
 
 
 def build_skill_query(proposer_trace: "AgentTrace[ProposerResponse]") -> str:
@@ -246,9 +466,22 @@ def build_skill_query_from_skill_proposer(
     Returns:
         Formatted query string for the skill generator.
     """
+    root_cause_analysis = getattr(proposer_trace.output, "root_cause_analysis", "") or "[not provided]"
+    coverage_plan = getattr(proposer_trace.output, "coverage_plan", "") or "[not provided]"
+    regression_risks = getattr(proposer_trace.output, "regression_risks", "") or "[not provided]"
+
     return f"""Proposed tool or skill (high level description): {proposer_trace.output.proposed_skill}
 
-Justification: {proposer_trace.output.justification}"""
+Justification: {proposer_trace.output.justification}
+
+Root cause analysis from proposer:
+{root_cause_analysis}
+
+Failure coverage plan:
+{coverage_plan}
+
+Regression risks / anti-regression guards:
+{regression_risks}"""
 
 
 def build_judge_query(
@@ -259,9 +492,14 @@ def build_judge_query(
     skills_content: str,
     proposal: str = "",
     justification: str = "",
+    proposer_root_cause_analysis: str = "",
+    proposer_coverage_plan: str = "",
+    proposer_regression_risks: str = "",
     parent_skill_summary: str = "",
     candidate_skill_summary: str = "",
     skill_diff: str = "",
+    case_type: str = "failure",
+    case_feedback: str = "",
 ) -> str:
     """Build the prompt for the LLM judge.
 
@@ -276,17 +514,69 @@ def build_judge_query(
     candidate_section = candidate_skill_summary or "[not provided]"
     diff_section = skill_diff or "[not provided]"
 
-    return f"""You are evaluating whether newly added/modified skills would help an AI agent solve a task it previously failed.
+    is_regression = case_type == "regression"
+    case_intro = (
+        "You are comparing two skill sets on a case where the parent/original behavior was already correct."
+        if is_regression
+        else "You are comparing two skill sets on a case where the parent/original behavior previously failed."
+    )
+    baseline_label = "the parent/anchor program skill set"
+    answer_label = "Agent's Prior Correct Answer" if is_regression else "Agent's Wrong Answer"
+    task_steps = (
+        """1. Identify why the original trajectory reached the expected answer.
+2. Estimate parent_success_prob: probability the parent/anchor skill set preserves that correct behavior.
+3. Estimate candidate_success_prob: probability the candidate skill set preserves that correct behavior.
+4. Compare the concrete skill diff and proposer regression risks.
+5. Set match_score from candidate-vs-parent relative strength, below 0.5 when the candidate is more likely to regress."""
+        if is_regression
+        else """1. Identify the key step where the original trajectory went wrong.
+2. Estimate parent_success_prob: probability the parent/anchor skill set would solve this same case.
+3. Estimate candidate_success_prob: probability the candidate skill set would solve this same case.
+4. Compare the concrete skill diff and proposer coverage plan.
+5. Set match_score from candidate-vs-parent relative strength, above 0.5 only when the candidate is meaningfully more likely to solve the case."""
+    )
+
+    regression_note = (
+        "\nFor this regression case, the parent/original behavior already reached the expected answer. "
+        "Score the challenger below 0.5 if the candidate skill is likely to change a correct method, "
+        "choose a different source slice, alter units/rounding, or otherwise introduce a regression.\n"
+        if is_regression
+        else ""
+    )
+    feedback_section = f"\n## Case Feedback\n{case_feedback}\n" if case_feedback else ""
+    proposer_analysis_section = ""
+    if proposer_root_cause_analysis or proposer_coverage_plan or proposer_regression_risks:
+        proposer_analysis_section = f"""
+## Proposer Deep Analysis
+Root cause analysis:
+{proposer_root_cause_analysis or "[not provided]"}
+
+Coverage plan:
+{proposer_coverage_plan or "[not provided]"}
+
+Regression risks / guards:
+{proposer_regression_risks or "[not provided]"}
+
+Use this as the proposer's hypothesis, not as ground truth. Verify whether the
+candidate skill actually implements the stated coverage and anti-regression
+guards for this specific case.
+"""
+
+    return f"""{case_intro}
 
 Treat this as a pairwise match:
-- Baseline player: the original agent behavior shown in the failed trajectory.
-- Challenger player: the same agent with the skills listed below available.
+- Player A / parent: {baseline_label}.
+- Player B / candidate: the same agent with the candidate skills listed below.
 
-This is an offline skill-evolution estimate, not a strict acceptance test. Score
-partial improvements when the skill addresses the root cause but may not fully
-guarantee the exact answer. Use probabilities instead of only a hard yes/no.
-Do not require certainty. Estimate the probability of success under the
-challenger skills compared with the parent skills.
+This is an offline skill-evolution estimate, not a strict acceptance test.
+Do NOT score the candidate in isolation. Estimate both parent_success_prob and
+candidate_success_prob on the same case, then convert the relative advantage
+into match_score:
+- 0.50 means no meaningful relative advantage.
+- >0.50 means candidate is more likely to succeed than parent.
+- <0.50 means candidate is worse or more likely to regress than parent.
+- Keep match_score near 0.50 when both programs are likely to fail or evidence is weak.
+{regression_note}
 
 ## Original Question
 {question}
@@ -294,11 +584,12 @@ challenger skills compared with the parent skills.
 ## Expected Answer
 {ground_truth}
 
-## Agent's Failed Attempt (trajectory summary)
+## Agent's Prior Attempt (trajectory summary)
 {trace_summary}
 
-## Agent's Wrong Answer
+## {answer_label}
 {agent_answer}
+{feedback_section}
 
 ## Parent Skill Summary
 {parent_section}
@@ -311,6 +602,7 @@ challenger skills compared with the parent skills.
 
 ## Proposal Justification
 {justification or "[not provided]"}
+{proposer_analysis_section}
 
 ## Skill Diff / Concrete Change
 {diff_section}
@@ -319,18 +611,20 @@ challenger skills compared with the parent skills.
 {skills_content}
 
 ## Your Task
-1. Identify the key step where the agent went wrong.
-2. Compare parent skill guidance against candidate skill guidance.
-3. Decide whether the candidate change addresses the root cause better than the parent.
-4. Predict what the agent would do differently at that step given the candidate skills.
-5. Estimate the probability that this changed behavior would reach the expected answer.
+{task_steps}
 
 Respond ONLY with a JSON object (no markdown fences):
 {{
   "root_cause": "<brief description of the original failure cause>",
-  "hypothetical_action": "<brief description of what the agent would do differently>",
+  "parent_hypothetical_action": "<brief description of what the parent/anchor skill set would make the agent do>",
+  "candidate_hypothetical_action": "<brief description of what the candidate skill set would make the agent do differently>",
+  "hypothetical_action": "<short candidate action summary for backward compatibility>",
+  "parent_success_prob": <0.0 to 1.0, probability parent/anchor reaches the expected answer on this case>,
+  "candidate_success_prob": <0.0 to 1.0, probability candidate reaches the expected answer on this case>,
+  "relative_advantage": <-1.0 to 1.0, candidate_success_prob - parent_success_prob after considering regression risk>,
+  "match_score": <0.0 to 1.0, pairwise score for candidate vs parent; 0.5 is draw>,
   "skill_addresses_root_cause": <0.0 to 1.0, how directly the skill addresses the failure cause>,
-  "probability_of_success": <0.0 to 1.0, probability the challenger reaches the expected answer>,
+  "probability_of_success": <0.0 to 1.0, same as candidate_success_prob for backward compatibility>,
   "would_succeed": <true or false>,
   "confidence": <0.0 to 1.0, confidence in your probability estimate>,
   "remaining_blockers": ["<short blocker>", "..."],
