@@ -40,6 +40,54 @@ compatibility: opencode
 - Keep the skill concise and specific.
 - Include the reusable rule the agent should follow.
 - If editing an existing skill, preserve relevant content and improve it instead of replacing it blindly.
+- Optimize for expected task utility, not text quality. A useful skill must encode
+  the concrete failure mechanism it prevents, the executable recovery procedure,
+  and the risky operations it forbids.
+- Encode the proposer's boundaries directly in the skill body with these sections:
+  - `## When To Use`: concrete task/source signals that should activate the skill.
+  - `## Do Not Use`: concrete cases where the skill is irrelevant or likely to regress behavior.
+  - `## Failure Mechanism`: the domain-specific reason prior runs failed, stated as
+    a causal mechanism rather than a generic label. Example: "formula strings do
+    not execute in the headless spreadsheet writer, so formulas must be computed
+    into static values before writing."
+  - `## Procedure`: concrete, ordered, executable steps the agent must perform.
+    Avoid generic advice such as "check carefully" unless it names exactly what
+    to check, where, and how to reject the wrong alternative.
+  - `## Invariants`: source bindings, formulas, units, window membership, rounding order,
+    output format, or other correct behavior that must be preserved.
+  - `## High-Risk Operations`: a blacklist of operations that must not be performed
+    because they caused or are likely to cause regressions.
+  - `## Regression Risks`: likely failure modes and anti-regression guards.
+- Do not write a generic always-on skill. If the proposal's applicability boundary is narrow,
+  make the skill narrow.
+- Do not write a memorized one-case skill. The skill must encode a reusable failure
+  mechanism, not the surface details of the sampled task.
+- Use an abstraction ladder:
+  - BAD: "For this exact file/date/entity, do this exact fix."
+  - BETTER: "When a task has a bounded set of inputs, enumerate that set before acting."
+  - BEST: "When a task depends on selecting, transforming, or validating a bounded
+    set of artifacts, first freeze the inclusion rule, excluded alternatives,
+    operation semantics, and final acceptance check before executing."
+- Training-case literals may appear only inside `## Worked Example`, never in
+  `description`, `When To Use`, `Failure Mechanism`, `Procedure`, `Invariants`,
+  `High-Risk Operations`, or `Regression Risks`, unless the literal is a true
+  domain convention required by the task family. Treat these as training-case
+  literals: task ids, source filenames, exact dates/times, object names, labels,
+  entity names, answer values, wrong predicted values, sampled constants,
+  environment-specific paths, one-off API responses, and dataset-specific IDs.
+- Worked examples should illustrate the abstract mechanism with synthetic or
+  minimally changed values when possible. If using a trace-derived example,
+  explicitly phrase the surrounding rule as a pattern that applies to different
+  inputs, files, entities, tools, environments, formats, and constants.
+- Prefer family-level trigger signals such as "bounded input-set selection",
+  "representation/format conversion", "ambiguous source binding",
+  "operation-order ambiguity", "stateful side-effect risk", or "final artifact
+  validation" over dataset-specific nouns such as a particular table, website,
+  document, API object, date range, file path, UI element, or answer.
+- Reject "correct but useless" prose. If the draft could apply to almost any task
+  (e.g. "inspect before editing", "verify calculations", "make minimal changes"),
+  rewrite it into a mechanism-specific protocol with concrete fields and a
+  high-risk-operation blacklist.
 
 ## Skills That Require Mandatory Intermediate Outputs
 
@@ -96,6 +144,15 @@ angle-bracket placeholders.
 - Target the most common failure mode from the proposer's analysis.
 - If there is a tempting wrong answer, add a "Wrong approach:" note so the contrast is
   visible.
+- NEVER let an intermediate scaffold value double as the final answer. Counting,
+  ledger, and grid blocks often contain a self-check field (e.g. `ledger_count_check`,
+  "expected N tests", "rows x periods = N"). That N is the SIZE of the grid, not the
+  result. The worked example's `Answer:` must show the real computed result (e.g. the
+  count of predicate-satisfying members summed across periods), and it must be visibly
+  different from any such scaffold count. If they would coincide, choose example values
+  where they differ, and add a "Wrong approach:" note that emitting the grid size as the
+  answer is incorrect. Do not write a worked example whose stated answer equals a
+  scaffold/expected-count field.
 
 Minimal format:
 

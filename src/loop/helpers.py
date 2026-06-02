@@ -99,11 +99,13 @@ def build_proposer_query(
 
         feedback_section = f"\nStructured Failure Feedback:\n{feedback}\n" if feedback else ""
 
+        # NOTE: the raw agent answer and the ground-truth answer are deliberately
+        # NOT printed here. Leaking them lets the skill author memorize per-task
+        # answers (verbatim "Answer: X / Wrong: Y" worked examples) instead of a
+        # general procedure. Only the structured, non-oracle failure feedback below
+        # (error shape, likely surfaces) is exposed.
         failure_sections.append(f"""### Failure {i} [Category: {category}]{question_line}
 {trace_summary}
-
-Agent Answer: {agent_answer}
-Ground Truth: {ground_truth}
 {feedback_section}
 """)
 
@@ -142,18 +144,10 @@ Analyze the patterns across these failures to identify a GENERAL improvement, no
 {failures_text}
 
 ## Your Task
-1. Build a per-failure root-cause matrix before choosing a proposal.
-   - For each failure, identify the earliest divergent source/table/row/column/formula/unit/rounding step.
-   - Use the provided predicted-vs-expected comparison to locate the first wrong intermediate, not just the final answer.
-2. Identify the shared reusable capability gap, but keep distinct failure modes separate.
-   - Do not hide uncovered cases behind a generic "verify more carefully" proposal.
-   - If one sampled failure is not covered by your proposal, say that explicitly in coverage_plan.
-3. Check if any EXISTING skill should have handled these failures.
-4. If yes → propose EDITING that listed project skill only (action="edit", target_skill="skill-name").
-5. If no → propose a NEW skill (action="create").
-6. Reference any related DISCARDED iterations and explain how your proposal differs.
-7. Include regression-risk analysis: how this proposal could degrade previously correct tasks, and what guard prevents that.
-8. Fill root_cause_analysis, coverage_plan, and regression_risks with concrete details."""
+1. For each failure, name the earliest divergent source/table/row/column/formula/unit/rounding step (not just the final answer).
+2. Propose ONE general, reusable fix for the shared root cause; keep distinct failure modes separate and state any uncovered failure in coverage_plan.
+3. Prefer EDITING a listed project skill when one should have caught these; otherwise CREATE. Note how your proposal differs from any DISCARDED iteration.
+4. Fill all required fields with concrete details: root_cause_analysis, coverage_plan, should_apply_when, should_not_apply_when, invariants_to_preserve, regression_risks."""
 
 
 _DEFAULT_ERROR_SURFACE_HINTS: dict[str, list[str]] = {
@@ -191,10 +185,10 @@ def build_regression_success_feedback(
     """
     pred_nums = _extract_numbers(agent_answer)
     exp_nums = _extract_numbers(ground_truth)
+    # Answer-blind: state that this case was already correct and which surfaces to
+    # preserve, without printing the (correct) answer value itself.
     lines = [
         "- regression_case: trajectory already produced the correct answer",
-        f"- correct_answer: {agent_answer}",
-        f"- expected_answer: {ground_truth}",
     ]
     if pred_nums and exp_nums and pred_nums == exp_nums:
         lines.append("- match_type: exact numeric match")
@@ -225,9 +219,12 @@ def build_answer_comparison_feedback(
 ) -> str:
     """Create structured, non-oracle comparison feedback for proposer prompts.
 
-    This does not invent hidden intermediate values.  It makes the known answer
-    delta explicit and lists the most likely verification surfaces the proposer
-    should inspect in the trajectory.
+    Deliberately answer-blind: it never emits the predicted answer, the expected
+    (ground-truth) answer, or any signed delta/ratio that would let the skill
+    author reconstruct the answer (predicted ± delta = expected). It exposes only
+    the *shape* of the error (arity, scale-factor, close/large bucket) and the
+    likely verification surfaces, so the proposer learns a general procedure
+    instead of memorizing per-task answers.
     """
     pred_nums = _extract_numbers(predicted)
     exp_nums = _extract_numbers(expected)
@@ -235,33 +232,15 @@ def build_answer_comparison_feedback(
     lines = []
     if failure_type:
         lines.append(f"- failure_type: {failure_type}")
-    lines.append(f"- predicted_answer: {predicted}")
-    lines.append(f"- expected_answer: {expected}")
 
     if pred_nums and exp_nums:
         pairs = list(zip(pred_nums, exp_nums))
-        diffs = [p - e for p, e in pairs]
-        abs_diffs = [abs(d) for d in diffs]
+        abs_diffs = [abs(p - e) for p, e in pairs]
         ratios = [
             (p / e)
             for p, e in pairs
             if e not in (0.0, -0.0)
         ]
-        lines.append(
-            "- numeric_delta: "
-            + ", ".join(
-                f"pred[{idx}] - expected[{idx}] = {diff:.12g}"
-                for idx, diff in enumerate(diffs[:6])
-            )
-        )
-        if ratios:
-            lines.append(
-                "- numeric_ratio: "
-                + ", ".join(
-                    f"pred[{idx}] / expected[{idx}] = {ratio:.12g}"
-                    for idx, ratio in enumerate(ratios[:6])
-                )
-            )
         lines.append(
             "- mismatch_shape: "
             + _numeric_mismatch_shape(abs_diffs, ratios, len(pred_nums), len(exp_nums))
@@ -273,12 +252,13 @@ def build_answer_comparison_feedback(
     lines.append("- likely_error_surfaces: " + "; ".join(likely))
     lines.append(
         "- first_divergence_to_inspect: compare the trajectory's extracted rows/columns, "
-        "unit conversions, formula choice, aggregation set, and final rounding against the expected answer; "
-        "do not assume final-answer formatting is the root cause unless numeric values already match."
+        "unit conversions, formula choice, aggregation set, and final rounding against the "
+        "structured mismatch labels above; do not assume final-answer formatting is the root cause."
     )
     lines.append(
         "- required_proposer_fix: propose a reusable verification gate that would force the agent "
-        "to expose and check the earliest divergent intermediate, not merely restate the final expected answer."
+        "to expose and check the earliest divergent intermediate. Do NOT hardcode any specific "
+        "answer or wrong value into the skill; worked examples must use general/synthetic placeholders."
     )
     return "\n".join(lines)
 
@@ -300,21 +280,23 @@ def _numeric_mismatch_shape(
     n_pred: int,
     n_exp: int,
 ) -> str:
+    # Emit only categorical labels. Raw deltas/ratios are withheld: combined with
+    # the (also-withheld) predicted answer they would reconstruct the ground truth.
     labels: list[str] = []
     if n_pred != n_exp:
         labels.append(f"numeric_arity_mismatch(pred={n_pred}, expected={n_exp})")
-    if abs_diffs:
-        max_abs = max(abs_diffs)
-        labels.append(f"max_abs_delta={max_abs:.12g}")
     if ratios:
         max_ratio_gap = max(abs(r - 1.0) for r in ratios)
-        labels.append(f"max_relative_gap={max_ratio_gap:.6g}")
         if any(abs(abs(r) - 10.0) < 0.5 or abs(abs(r) - 100.0) < 5.0 for r in ratios):
             labels.append("possible_scale_factor_error")
         elif max_ratio_gap < 0.02:
             labels.append("close_numeric_mismatch")
         elif max_ratio_gap > 0.5:
             labels.append("large_numeric_mismatch")
+        else:
+            labels.append("moderate_numeric_mismatch")
+    elif abs_diffs:
+        labels.append("numeric_mismatch")
     return ", ".join(labels) if labels else "numeric_mismatch"
 
 
@@ -387,6 +369,7 @@ def append_feedback(
     active_skills: list[str] | None = None,
     failure_category: str | None = None,
     root_cause: str | None = None,
+    remaining_blockers: list[str] | None = None,
 ) -> None:
     """Append feedback entry to history file with outcome tracking.
 
@@ -400,7 +383,9 @@ def append_feedback(
         parent_score: The parent's score before this proposal.
         active_skills: List of skills that were active during evaluation.
         failure_category: Category of failure (e.g., "methodology", "formatting").
-        root_cause: Brief description of root cause.
+        root_cause: Brief description of root cause (from the judge when available).
+        remaining_blockers: Judge-identified blockers the proposal did NOT resolve,
+            so the next proposer knows what still needs fixing instead of only a score.
     """
     # Build outcome section if available
     outcome_section = ""
@@ -418,6 +403,10 @@ def append_feedback(
         diagnostic_section += f"\n**Failure Category**: {failure_category}"
     if root_cause:
         diagnostic_section += f"\n**Root Cause**: {root_cause}"
+    if remaining_blockers:
+        blockers = "; ".join(b.strip() for b in remaining_blockers if str(b).strip())
+        if blockers:
+            diagnostic_section += f"\n**Remaining Blockers (judge)**: {blockers}"
 
     entry = f"""
 ## {iteration}
@@ -468,6 +457,9 @@ def build_skill_query_from_skill_proposer(
     """
     root_cause_analysis = getattr(proposer_trace.output, "root_cause_analysis", "") or "[not provided]"
     coverage_plan = getattr(proposer_trace.output, "coverage_plan", "") or "[not provided]"
+    should_apply_when = getattr(proposer_trace.output, "should_apply_when", "") or "[not provided]"
+    should_not_apply_when = getattr(proposer_trace.output, "should_not_apply_when", "") or "[not provided]"
+    invariants_to_preserve = getattr(proposer_trace.output, "invariants_to_preserve", "") or "[not provided]"
     regression_risks = getattr(proposer_trace.output, "regression_risks", "") or "[not provided]"
 
     return f"""Proposed tool or skill (high level description): {proposer_trace.output.proposed_skill}
@@ -480,6 +472,15 @@ Root cause analysis from proposer:
 Failure coverage plan:
 {coverage_plan}
 
+Use this skill only when:
+{should_apply_when}
+
+Do not use this skill when:
+{should_not_apply_when}
+
+Invariants to preserve:
+{invariants_to_preserve}
+
 Regression risks / anti-regression guards:
 {regression_risks}"""
 
@@ -489,147 +490,189 @@ def build_judge_query(
     question: str,
     agent_answer: str,
     ground_truth: str,
-    skills_content: str,
-    proposal: str = "",
-    justification: str = "",
-    proposer_root_cause_analysis: str = "",
-    proposer_coverage_plan: str = "",
-    proposer_regression_risks: str = "",
     parent_skill_summary: str = "",
     candidate_skill_summary: str = "",
     skill_diff: str = "",
     case_type: str = "failure",
     case_feedback: str = "",
+    proposer_root_cause: str = "",
 ) -> str:
     """Build the prompt for the LLM judge.
 
-    The judge sees the failed trajectory, the expected answer, and all current
-    skills, then predicts what the agent would do differently and whether the
-    new action would succeed.
+    The judge sees the concrete artifact (skill diff + summaries), the case, and
+    the proposer's claimed root cause. It must do two distinct things: (1) decide
+    whether the proposer's root-cause diagnosis is actually correct for this case
+    (so a misdiagnosis is caught rather than rubber-stamped), and (2) decide
+    whether the candidate diff concretely enforces a fix for that root cause. The
+    judge is NOT given the proposer's justification or coverage plan — only the
+    one-line root cause — so it cannot simply echo the author's reasoning.
 
     Returns:
         A prompt string for the judge LLM.
     """
-    parent_section = parent_skill_summary or "[not provided]"
-    candidate_section = candidate_skill_summary or "[not provided]"
-    diff_section = skill_diff or "[not provided]"
-
     is_regression = case_type == "regression"
-    case_intro = (
-        "You are comparing two skill sets on a case where the parent/original behavior was already correct."
-        if is_regression
-        else "You are comparing two skill sets on a case where the parent/original behavior previously failed."
-    )
-    baseline_label = "the parent/anchor program skill set"
     answer_label = "Agent's Prior Correct Answer" if is_regression else "Agent's Wrong Answer"
-    task_steps = (
-        """1. Identify why the original trajectory reached the expected answer.
-2. Estimate parent_success_prob: probability the parent/anchor skill set preserves that correct behavior.
-3. Estimate candidate_success_prob: probability the candidate skill set preserves that correct behavior.
-4. Compare the concrete skill diff and proposer regression risks.
-5. Set match_score from candidate-vs-parent relative strength, below 0.5 when the candidate is more likely to regress."""
+    case_intro = (
+        "On this case the original skills already produced the correct answer."
         if is_regression
-        else """1. Identify the key step where the original trajectory went wrong.
-2. Estimate parent_success_prob: probability the parent/anchor skill set would solve this same case.
-3. Estimate candidate_success_prob: probability the candidate skill set would solve this same case.
-4. Compare the concrete skill diff and proposer coverage plan.
-5. Set match_score from candidate-vs-parent relative strength, above 0.5 only when the candidate is meaningfully more likely to solve the case."""
+        else "On this case the original skills previously produced a wrong answer."
     )
-
-    regression_note = (
-        "\nFor this regression case, the parent/original behavior already reached the expected answer. "
-        "Score the challenger below 0.5 if the candidate skill is likely to change a correct method, "
-        "choose a different source slice, alter units/rounding, or otherwise introduce a regression.\n"
+    direction = (
+        "One set includes the Change Being Evaluated and the other does not — work out "
+        "which from the summaries. If that change risks breaking this currently-correct "
+        "case (picks a different source/row, changes units/rounding, adds an override), "
+        "the including set should score clearly LOWER."
         if is_regression
-        else ""
+        else "One set includes the Change Being Evaluated and the other does not — work out "
+        "which from the summaries. If that change concretely fixes the true cause of this "
+        "failure, the including set should score clearly HIGHER; if it is cosmetic, "
+        "off-target, or risky, it should NOT score higher."
     )
     feedback_section = f"\n## Case Feedback\n{case_feedback}\n" if case_feedback else ""
-    proposer_analysis_section = ""
-    if proposer_root_cause_analysis or proposer_coverage_plan or proposer_regression_risks:
-        proposer_analysis_section = f"""
-## Proposer Deep Analysis
-Root cause analysis:
-{proposer_root_cause_analysis or "[not provided]"}
+    proposer_rc_section = (
+        f"\n## Proposer's Claimed Root Cause (verify — do not assume correct)\n{proposer_root_cause}\n"
+        if proposer_root_cause and proposer_root_cause.strip()
+        else ""
+    )
 
-Coverage plan:
-{proposer_coverage_plan or "[not provided]"}
+    return f"""You are a careful, decisive reviewer comparing two skill sets on ONE case.
+Two skill sets are shown below as "Skill Set A" and "Skill Set B". The A/B
+assignment is randomized: neither label implies which set is older, newer, or
+proposed — judge purely on content. They differ only by the single "Change Being
+Evaluated" shown afterward, which one set includes and the other does not.
 
-Regression risks / guards:
-{proposer_regression_risks or "[not provided]"}
+{case_intro}
+Judge ONLY from the concrete skill content and the change shown; you are NOT given
+any author's rationale. Estimate each set's probability of reaching the expected
+answer on THIS case, then give a pairwise score for Set B over Set A.
 
-Use this as the proposer's hypothesis, not as ground truth. Verify whether the
-candidate skill actually implements the stated coverage and anti-regression
-guards for this specific case.
-"""
+Be decisive: commit to whichever set is more likely to reach the expected answer.
+Use 0.5 ONLY when the two sets are genuinely indistinguishable on this case — never
+as a safe default. A small but real difference must move the score off 0.5. {direction}
 
-    return f"""{case_intro}
+Do not reward polished but generic skill text. A useful skill is defined by three
+case-grounded dimensions:
+1. failure_mechanism_encoding: does the change name the domain-specific failure
+   mechanism that caused THIS case, not just a broad category like "verification"?
+2. executable_specificity: does it force concrete operations/checks that would
+   change the agent's behavior on THIS case, rather than advice like "be careful"?
+3. high_risk_blacklist: does it explicitly forbid tempting operations that would
+   cause the same failure or regressions on similar cases?
 
-Treat this as a pairwise match:
-- Player A / parent: {baseline_label}.
-- Player B / candidate: the same agent with the candidate skills listed below.
+The pairwise score must reflect those dimensions. If the Change Being Evaluated
+lacks the true failure mechanism or an executable remedy, do NOT give it a high
+B-over-A score merely because it is well written. If it introduces a risky
+operation without blacklisting it, lower the including set on regression cases
+and avoid credit on failure cases.
 
-This is an offline skill-evolution estimate, not a strict acceptance test.
-Do NOT score the candidate in isolation. Estimate both parent_success_prob and
-candidate_success_prob on the same case, then convert the relative advantage
-into match_score:
-- 0.50 means no meaningful relative advantage.
-- >0.50 means candidate is more likely to succeed than parent.
-- <0.50 means candidate is worse or more likely to regress than parent.
-- Keep match_score near 0.50 when both programs are likely to fail or evidence is weak.
-{regression_note}
+Also judge transferability. The skill should abstract from the observed case to
+the reusable failure mechanism. Penalize changes that look strong only because
+they name this case's surface details (exact files, dates/times, labels, entity
+names, paths, API objects, UI elements, answer values, or a single operation) in
+activation rules or invariants. Worked examples may contain concrete values, but
+the rule itself must help a new task with different inputs, files, entities,
+tools, environments, formats, constants, and neighboring operations from the same
+failure family. Score generalization_transfer high only when the change is
+specific about the mechanism while remaining portable across such variants.
 
-## Original Question
+First derive, independently from the trajectory and the expected answer, the
+earliest divergent step that actually caused this case to fail. Then judge the
+proposer's claimed root cause against your own finding: set
+proposer_root_cause_correct high only if the proposer located the same earliest
+divergence; set it low when the proposer misdiagnosed (e.g. blamed a formula
+when the real error was reading the wrong row/table, or the wrong percent
+denominator convention). Then judge skill_addresses_root_cause: how concretely
+the Change Being Evaluated enforces a fix for the TRUE root cause — not merely
+whether it adds plausible-looking structure. A change that builds elaborate
+contracts but does not constrain the actual divergent step scores low here.
+
+## Question
 {question}
 
 ## Expected Answer
 {ground_truth}
 
-## Agent's Prior Attempt (trajectory summary)
-{trace_summary}
-
 ## {answer_label}
 {agent_answer}
-{feedback_section}
 
-## Parent Skill Summary
-{parent_section}
+## Prior Trajectory (summary)
+{trace_summary}
+{feedback_section}{proposer_rc_section}
+## Skill Set A
+{parent_skill_summary or "[not provided]"}
 
-## Candidate Skill Summary
-{candidate_section}
+## Skill Set B
+{candidate_skill_summary or "[not provided]"}
 
-## Proposal / Intended Change
-{proposal or "[not provided]"}
-
-## Proposal Justification
-{justification or "[not provided]"}
-{proposer_analysis_section}
-
-## Skill Diff / Concrete Change
-{diff_section}
-
-## Candidate Skills Now Available to the Agent
-{skills_content}
-
-## Your Task
-{task_steps}
+## Change Being Evaluated (present in exactly one of the two sets above)
+{skill_diff or "[not provided]"}
 
 Respond ONLY with a JSON object (no markdown fences):
 {{
-  "root_cause": "<brief description of the original failure cause>",
-  "parent_hypothetical_action": "<brief description of what the parent/anchor skill set would make the agent do>",
-  "candidate_hypothetical_action": "<brief description of what the candidate skill set would make the agent do differently>",
-  "hypothetical_action": "<short candidate action summary for backward compatibility>",
-  "parent_success_prob": <0.0 to 1.0, probability parent/anchor reaches the expected answer on this case>,
-  "candidate_success_prob": <0.0 to 1.0, probability candidate reaches the expected answer on this case>,
-  "relative_advantage": <-1.0 to 1.0, candidate_success_prob - parent_success_prob after considering regression risk>,
-  "match_score": <0.0 to 1.0, pairwise score for candidate vs parent; 0.5 is draw>,
-  "skill_addresses_root_cause": <0.0 to 1.0, how directly the skill addresses the failure cause>,
-  "probability_of_success": <0.0 to 1.0, same as candidate_success_prob for backward compatibility>,
-  "would_succeed": <true or false>,
-  "confidence": <0.0 to 1.0, confidence in your probability estimate>,
-  "remaining_blockers": ["<short blocker>", "..."],
-  "reasoning": "<one or two sentences>"
+  "root_cause": "<the earliest divergent step you independently identified>",
+  "proposer_root_cause_correct": <0.0-1.0 how well the proposer's claimed root cause matches yours>,
+  "skill_addresses_root_cause": <0.0-1.0 how concretely the Change Being Evaluated fixes the TRUE root cause>,
+  "failure_mechanism_encoding": <0.0-1.0 whether the change encodes the concrete domain-specific failure mechanism>,
+  "executable_specificity": <0.0-1.0 whether the change gives concrete operations/checks that would alter behavior>,
+  "high_risk_blacklist": <0.0-1.0 whether the change forbids likely harmful operations/regressions>,
+  "generalization_transfer": <0.0-1.0 whether the change abstracts the mechanism beyond this exact case without becoming vague>,
+  "set_a_success_prob": <0.0-1.0 probability Skill Set A reaches the expected answer>,
+  "set_b_success_prob": <0.0-1.0 probability Skill Set B reaches the expected answer>,
+  "b_over_a_score": <0.0-1.0 pairwise score for Set B over Set A; 0.5 ONLY if truly indistinguishable>,
+  "confidence": <0.0-1.0 confidence in your estimate>,
+  "remaining_blockers": ["<short blocker the change still does not fix>"],
+  "reasoning": "<one sentence>"
 }}"""
+
+
+def build_skill_revision_query(
+    target_skill: str,
+    current_skill_markdown: str,
+    proposer_root_cause: str,
+    original_proposal: str,
+    judge_root_cause: str,
+    judge_blockers: list[str],
+    judge_reasoning: str = "",
+) -> str:
+    """Build the generator query for one judge-driven revision of a child skill.
+
+    The generator is shown two clearly separated signals: the proposer's ORIGINAL
+    intent (what the skill tried to fix) and the JUDGE's independent verdict on
+    why that fix falls short (the correction direction). The generator must keep
+    the skill's valid structure and make a targeted change toward the judge's
+    blockers — not rewrite from scratch.
+    """
+    blockers_text = "\n".join(f"- {b}" for b in judge_blockers) or "- (none stated)"
+    return f"""REVISE existing skill: {target_skill}
+
+A skeptical judge reviewed this skill against held-out failures and concluded it
+does not yet solve the failure's true root cause. Revise the skill with ONE
+targeted change. Keep all still-valid content (triggers, invariants, correct
+worked examples); do not rewrite from scratch.
+
+## Original intent (proposer) — what this skill tried to fix
+{proposer_root_cause or original_proposal or "[not provided]"}
+
+## Judge's independent verdict — the correction direction (treat as authoritative)
+Judge's identified true root cause:
+{judge_root_cause or "[not provided]"}
+
+Why the current skill still falls short (unresolved blockers):
+{blockers_text}
+
+Judge note: {judge_reasoning or "[none]"}
+
+## Current SKILL.md (revise this)
+{current_skill_markdown}
+
+Produce the complete revised SKILL.md. Focus the change on enforcing a fix for
+the judge's true root cause (e.g. add/repair the protocol-block field or gate
+that pins the actual divergent step), and ensure worked examples show the real
+final answer rather than any intermediate scaffold value. If the judge's
+blockers indicate low transferability or case-specific overfitting, revise by
+lifting exact files, dates/times, labels, entity names, paths, answer values,
+one-off operations, and environment-specific constants out of the main rules into
+a reusable failure-family contract."""
 
 
 def build_prompt_query_from_prompt_proposer(

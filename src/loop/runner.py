@@ -73,6 +73,7 @@ from .helpers import (
     build_skill_query_from_skill_proposer,
     build_prompt_query_from_prompt_proposer,
     build_judge_query,
+    build_skill_revision_query,
     append_feedback,
     read_feedback_history,
     update_prompt_file,
@@ -112,6 +113,7 @@ class MutationResult:
     root_cause_analysis: str = ""
     coverage_plan: str = ""
     regression_risks: str = ""
+    skill_name: str = ""
 
 
 @dataclass
@@ -161,6 +163,11 @@ class JudgeMatchResult:
     valid: bool = True
     root_cause: str = ""
     skill_addresses_root_cause: float = 0.0
+    proposer_root_cause_correct: float = 0.0
+    failure_mechanism_encoding: float = 0.0
+    executable_specificity: float = 0.0
+    high_risk_blacklist: float = 0.0
+    generalization_transfer: float = 0.0
     probability_of_success: float = 0.0
     parent_success_prob: float = 0.0
     candidate_success_prob: float = 0.0
@@ -272,6 +279,14 @@ class SelfImprovingLoop:
 
         # Round-robin sampling state — seeded from preloaded categories if available
         self._category_offset = 0
+        # Independent rotation for the held-out judge pool (LLM-judge mode), so
+        # judge-case selection never shares offsets with proposer sampling.
+        self._judge_cat_offset: dict[str, int] = {}
+        # Coverage-priority rotation: how many times each failure (keyed by
+        # question) has been shown to the proposer. Least-shown failures are
+        # picked first so successive iterations sweep distinct failures instead
+        # of repeatedly re-proposing on the same few.
+        self._failure_shown_count: dict[str, int] = {}
         if preloaded_trajectories:
             cats = sorted({entry[4] for entry in preloaded_trajectories})
             self._per_cat_offset: dict[str, int] = {cat: 0 for cat in cats}
@@ -519,6 +534,9 @@ class SelfImprovingLoop:
 
             # Collect failures
             failures: list[tuple[AgentTrace, str, str, str]] = []  # (trace, agent_answer, ground_truth, category)
+            # Parallel (question, answer, category) for the failed samples, used as
+            # the in-sample term when scoring the child (did it fix what it saw?).
+            in_sample_samples: list[tuple[str, str, str]] = []
             for trace, (question, answer, category) in zip(traces, test_samples):
                 agent_answer = (
                     trace.output.final_answer if trace.output and trace.output.final_answer else "[PARSE FAILED]"
@@ -535,6 +553,7 @@ class SelfImprovingLoop:
                 self._emit("sample", question=question, category=category, score=avg_score, passed=avg_score >= threshold)
                 if avg_score < threshold:
                     failures.append((trace, agent_answer, answer, category))
+                    in_sample_samples.append((question, answer, category))
 
             # Always propose if any failures exist
             if len(failures) == 0:
@@ -559,9 +578,9 @@ class SelfImprovingLoop:
                 proposal = mutation_result.proposal
                 justification = mutation_result.justification
 
-                # Evaluate child
+                # Evaluate child: blend in-sample fix rate with held-out generalization
                 _log("", f"  -> Evaluating {child_name}...")
-                child_score = await self._evaluate(self.val_data)  # accumulates to self._iter_cost
+                child_score = await self._score_child(in_sample_samples)  # accumulates to self._iter_cost
 
                 # Update frontier or discard
                 added = self.manager.update_frontier(
@@ -657,6 +676,74 @@ class SelfImprovingLoop:
         _log("COST", f"Base eval cost: ${self._iter_cost:.4f} | {self._format_cost_breakdown()}")
         self._emit("baseline", score=base_score, n_skills=len(self._get_active_skills()))
 
+    def _generalization_samples(
+        self, in_sample_samples: list[tuple[str, str, str]]
+    ) -> list[tuple[str, str, str]]:
+        """Pick held-out samples the proposer never saw this iteration.
+
+        Prefers a dedicated validation split (``val_data``). When none exists
+        (e.g. trajectory-preloaded runs put everything in the training pools),
+        fall back to a deterministic slice of the training pools that excludes
+        the in-sample failure questions, capped by ``generalization_sample_count``.
+        """
+        if self.val_data:
+            return self.val_data
+
+        seen = {q for q, _, _ in in_sample_samples}
+        held_out: list[tuple[str, str, str]] = []
+        cap = max(0, self.config.generalization_sample_count)
+        if cap == 0:
+            return []
+        # Round-robin across categories for a balanced held-out batch.
+        for cat in sorted(self.train_pools.keys()):
+            for question, answer in self.train_pools[cat]:
+                if question not in seen:
+                    held_out.append((question, answer, cat))
+        return held_out[:cap]
+
+    async def _score_child(
+        self, in_sample_samples: list[tuple[str, str, str]]
+    ) -> float:
+        """Score a freshly mutated child by blending two signals.
+
+        ``child_score = w * in_sample_fix_rate + (1-w) * generalization_rate``
+
+        - in-sample term: did the candidate fix the failures it was proposed for?
+        - generalization term: does it hold up on unseen held-out samples?
+
+        Degrades gracefully when one term is unavailable (e.g. no held-out data).
+        """
+        weight = min(1.0, max(0.0, self.config.in_sample_score_weight))
+
+        in_sample_score = (
+            await self._evaluate(in_sample_samples) if in_sample_samples else None
+        )
+        gen_samples = self._generalization_samples(in_sample_samples)
+        gen_score = await self._evaluate(gen_samples) if gen_samples else None
+
+        if in_sample_score is None and gen_score is None:
+            _log("", "  [WARN] No samples to score child; defaulting to 0.0")
+            return 0.0
+        if gen_score is None:
+            _log(
+                "",
+                f"  -> Child score (in-sample only, no held-out): {in_sample_score:.4f}",
+            )
+            return in_sample_score
+        if in_sample_score is None:
+            return gen_score
+
+        blended = weight * in_sample_score + (1.0 - weight) * gen_score
+        _log(
+            "",
+            (
+                f"  -> Child score {blended:.4f} = {weight:.2f}*in_sample({in_sample_score:.4f})"
+                f" + {1.0 - weight:.2f}*generalization({gen_score:.4f}; "
+                f"n={len(gen_samples)})"
+            ),
+        )
+        return blended
+
     async def _evaluate(self, data: list[tuple[str, str, str]]) -> float:
         """Evaluate base agent on data.
 
@@ -744,7 +831,28 @@ class SelfImprovingLoop:
             justification = proposer_output.justification
             root_cause_analysis = getattr(proposer_output, "root_cause_analysis", "") or ""
             coverage_plan = getattr(proposer_output, "coverage_plan", "") or ""
+            should_apply_when = getattr(proposer_output, "should_apply_when", "") or ""
+            should_not_apply_when = getattr(proposer_output, "should_not_apply_when", "") or ""
+            invariants_to_preserve = getattr(proposer_output, "invariants_to_preserve", "") or ""
             regression_risks = getattr(proposer_output, "regression_risks", "") or ""
+            required_boundaries = {
+                "should_apply_when": should_apply_when,
+                "should_not_apply_when": should_not_apply_when,
+                "invariants_to_preserve": invariants_to_preserve,
+                "regression_risks": regression_risks,
+            }
+            missing_boundaries = [
+                name for name, value in required_boundaries.items() if not value.strip()
+            ]
+            if missing_boundaries:
+                _log(
+                    "",
+                    (
+                        "  [WARN] Skill proposer missing boundary fields; "
+                        f"skip generator: {', '.join(missing_boundaries)}"
+                    ),
+                )
+                return None
             proposer_confidence = self._clamp01(
                 getattr(proposer_output, "confidence", None),
                 default=self.config.puct_default_prior,
@@ -784,6 +892,15 @@ Root cause analysis from proposer:
 
 Failure coverage plan:
 {coverage_plan or "[not provided]"}
+
+Use this skill only when:
+{should_apply_when}
+
+Do not use this skill when:
+{should_not_apply_when}
+
+Invariants to preserve:
+{invariants_to_preserve}
 
 Regression risks / anti-regression guards:
 {regression_risks or "[not provided]"}
@@ -935,6 +1052,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
         # Commit changes
         self.manager.commit(f"{child_name}: {proposed[:50]}")
 
+        # Resolve which skill was created/edited (used by the refine loop).
+        if evolution_mode == "skill_only":
+            resolved_skill_name = (
+                target_skill
+                if action_type == "edit" and target_skill
+                else (created_skill or "")
+            )
+        else:
+            resolved_skill_name = ""
+
         # Return mutation info (feedback will be written by caller with outcome)
         return MutationResult(
             child_name=child_name,
@@ -944,6 +1071,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
             root_cause_analysis=root_cause_analysis,
             coverage_plan=coverage_plan,
             regression_risks=regression_risks,
+            skill_name=resolved_skill_name or "",
         )
 
     async def _mutate_with_fallback(
@@ -1111,6 +1239,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
             description=fallback_description,
             compatibility=None,
         )
+        if getattr(self.config, "validate_worked_examples", False) and (
+            self._has_misleading_worked_example(skill_markdown)
+        ):
+            _log(
+                "",
+                (
+                    f"  [WARN] {skill_name}: worked example may present a scaffold count "
+                    "as the final answer; refine loop will attempt a revision"
+                ),
+            )
         return skill_name
 
     @staticmethod
@@ -1252,12 +1390,19 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 self.manager.switch_to(restore_to)
 
     def _select_bt_anchor_nodes(self, parent: str, child_name: str) -> list[str]:
-        """Choose globally connected Bradley-Terry anchors for a new child."""
-        candidates: list[str] = [parent, "base"]
+        """Choose Bradley-Terry anchors for a new child.
+
+        Kept deliberately small (parent + current frontier best) to bound judge
+        call volume: each extra anchor re-judges the entire scoring set. ``base``
+        is NOT added per-child — it is already the fixed global anchor of the BT
+        fit, so cross-generation comparability is preserved without paying for a
+        base re-judge on every candidate. When the frontier best is the parent
+        itself (or the frontier is empty), only the parent anchor is used.
+        """
+        candidates: list[str] = [parent]
         best = self.manager.get_best_from_frontier()
         if best:
             candidates.append(best)
-        candidates.extend(name for name, _score in self.manager.get_frontier_with_scores()[:2])
 
         existing = set(self.manager.list_programs())
         anchors: list[str] = []
@@ -1266,6 +1411,68 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 continue
             anchors.append(name)
         return anchors
+
+    @staticmethod
+    def _duel_ci_halfwidth(scores: list[float], delta: float) -> float:
+        """Normal CI half-width for a paired match-score mean.
+
+        Variance-aware: when the judge's per-case scores cluster tightly (the
+        common case here) the interval is narrow and a duel resolves in few
+        cases. A std floor guards against a coincidental near-tie producing an
+        overconfident decision at very small n. Distribution-free bounds
+        (Hoeffding / empirical-Bernstein) are far too loose at n≈4 — their
+        additive term alone exceeds the [0, 1] range — so a normal approximation
+        on the mean is used instead. Returns a wide 1.0 with too little data.
+        """
+        from statistics import NormalDist
+
+        n = len(scores)
+        if n < 2:
+            return 1.0
+        mean = sum(scores) / n
+        var = sum((s - mean) ** 2 for s in scores) / (n - 1)
+        std = max(math.sqrt(var), 0.05)  # std floor against tiny-n overconfidence
+        z = NormalDist().inv_cdf(1.0 - max(1e-6, min(0.5, delta)) / 2.0)
+        return z * std / math.sqrt(n)
+
+    def _duel_decision(self, result: "JudgeResult | None") -> str:
+        """Classify a champion duel as 'win', 'loss', or 'close'.
+
+        Uses the candidate-vs-anchor paired match scores: 0.5 is a draw. The
+        child clearly wins when even the CI lower bound exceeds 0.5, clearly
+        loses when the CI upper bound is below 0.5, else the duel is close.
+        """
+        if result is None:
+            return "close"
+        scores = [m.match_score for m in result.matches if getattr(m, "valid", True)]
+        n = len(scores)
+        if n < max(1, self.config.judge_duel_min_cases):
+            return "close"
+        mean = sum(scores) / n
+        h = self._duel_ci_halfwidth(scores, self.config.judge_duel_delta)
+        if mean + h < 0.5:
+            return "loss"
+        if mean - h > 0.5:
+            return "win"
+        return "close"
+
+    def _random_frontier_anchors(self, exclude: set[str], n: int) -> list[str]:
+        """Pick up to ``n`` random current frontier members not in ``exclude``."""
+        if n <= 0:
+            return []
+        existing = set(self.manager.list_programs())
+        members = [
+            name
+            for name, _score in self.manager.get_frontier_with_scores()
+            if name not in exclude and name in existing
+        ]
+        if not members:
+            return []
+        import random as _random
+
+        rng = _random.Random(f"stage2::{','.join(sorted(exclude))}::{len(members)}")
+        rng.shuffle(members)
+        return members[:n]
 
     @staticmethod
     def _build_child_diversity_hint(child_idx: int, sibling_proposals: list[str]) -> str:
@@ -1430,7 +1637,114 @@ and modify it to add these capabilities. Preserve all existing content that is s
             return diff[:max_chars].rstrip() + "\n[diff truncated]"
         return diff
 
+    @staticmethod
+    def _compact_judge_text(
+        text: str,
+        *,
+        max_chars: int,
+        max_line_chars: int = 1200,
+    ) -> str:
+        """Bound judge prompt fields and break long lines for Codex prompt chunking."""
+        value = str(text or "").strip()
+        if not value:
+            return ""
+
+        if len(value) > max_chars:
+            head_chars = max_chars * 2 // 3
+            tail_chars = max_chars - head_chars
+            omitted = len(value) - head_chars - tail_chars
+            value = (
+                f"{value[:head_chars].rstrip()}\n"
+                f"[... {omitted:,} chars omitted for judge prompt budget ...]\n"
+                f"{value[-tail_chars:].lstrip()}"
+            )
+
+        wrapped_lines: list[str] = []
+        for line in value.splitlines():
+            if len(line) <= max_line_chars:
+                wrapped_lines.append(line)
+                continue
+            start = 0
+            while start < len(line):
+                remaining = len(line) - start
+                suffix = " [line continued]" if remaining > max_line_chars else ""
+                chunk_chars = max_line_chars - len(suffix) if suffix else max_line_chars
+                wrapped_lines.append(line[start : start + chunk_chars] + suffix)
+                start += chunk_chars
+        return "\n".join(wrapped_lines)
+
+    def _summarize_trace_for_judge(self, trace: AgentTrace) -> str:
+        """Create a compact trace summary for judge calls.
+
+        AgentTrace.summarize only truncates parse-error traces. Judge prompts
+        must always be bounded because successful Codex trajectories can contain
+        very long result blocks or JSON lines that break Codex SDK chunking.
+        """
+        return self._compact_judge_text(
+            trace.summarize(head_chars=3000, tail_chars=1500),
+            max_chars=7000,
+            max_line_chars=1200,
+        )
+
+    @staticmethod
+    def _normalize_model_name(model: str | None) -> str:
+        m = (model or "").strip().lower()
+        for prefix in ("openai/", "anthropic/", "codex/"):
+            if m.startswith(prefix):
+                m = m[len(prefix):]
+        return m
+
+    def _generator_model_id(self) -> str:
+        """Best-effort model id of the skill generator (the skill author)."""
+        try:
+            opts = self.agents.skill_generator._get_options()
+        except Exception:
+            return ""
+        if isinstance(opts, dict):
+            return str(opts.get("model_id") or opts.get("model") or "")
+        return str(
+            getattr(opts, "model_id", None)
+            or getattr(opts, "model", None)
+            or getattr(opts, "model_name", None)
+            or ""
+        )
+
+    def _distinct_judge_model(self, provider: str) -> str:
+        """A sensible judge model for ``provider`` that differs from the generator.
+
+        Stays within the same provider (so credentials/SDK still work) but picks a
+        smaller/other default, which both de-correlates self-enhancement bias and
+        is cheaper (cf. panel-of-small-judges findings)."""
+        return {
+            "anthropic": "claude-haiku-4-5-20251001",
+            "openai": "gpt-4o-mini",
+            "codex": "gpt-5.1-codex-mini",
+        }.get(provider, "gpt-4o-mini")
+
     def _detect_judge_provider_and_model(self) -> tuple[str, str]:
+        """Return (provider, model) for judge calls.
+
+        Enforces that the judge does not run on the same model that authored the
+        skill (the generator) when ``judge_distinct_from_generator`` is set, to
+        avoid self-enhancement bias (a model favouring its own outputs)."""
+        provider, model = self._detect_judge_provider_and_model_raw()
+        if self.config.judge_distinct_from_generator:
+            gen = self._normalize_model_name(self._generator_model_id())
+            if gen and self._normalize_model_name(model) == gen:
+                alt = self._distinct_judge_model(provider)
+                if self._normalize_model_name(alt) != gen:
+                    _log(
+                        "JUDGE",
+                        (
+                            f"Judge model ({model}) == generator model; switching judge to "
+                            f"{alt} to avoid self-enhancement bias "
+                            f"(set judge_distinct_from_generator=False to override)"
+                        ),
+                    )
+                    model = alt
+        return provider, model
+
+    def _detect_judge_provider_and_model_raw(self) -> tuple[str, str]:
         """Return (provider, model) for judge calls based on the active SDK."""
         from src.harness.sdk_config import get_sdk
         sdk = get_sdk()
@@ -1479,16 +1793,15 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 "additionalProperties": False,
                 "properties": {
                     "root_cause": {"type": "string"},
-                    "parent_hypothetical_action": {"type": "string"},
-                    "candidate_hypothetical_action": {"type": "string"},
-                    "hypothetical_action": {"type": "string"},
-                    "parent_success_prob": {"type": "number"},
-                    "candidate_success_prob": {"type": "number"},
-                    "relative_advantage": {"type": "number"},
-                    "match_score": {"type": "number"},
+                    "proposer_root_cause_correct": {"type": "number"},
                     "skill_addresses_root_cause": {"type": "number"},
-                    "probability_of_success": {"type": "number"},
-                    "would_succeed": {"type": "boolean"},
+                    "failure_mechanism_encoding": {"type": "number"},
+                    "executable_specificity": {"type": "number"},
+                    "high_risk_blacklist": {"type": "number"},
+                    "generalization_transfer": {"type": "number"},
+                    "set_a_success_prob": {"type": "number"},
+                    "set_b_success_prob": {"type": "number"},
+                    "b_over_a_score": {"type": "number"},
                     "confidence": {"type": "number"},
                     "remaining_blockers": {
                         "type": "array",
@@ -1498,16 +1811,15 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 },
                 "required": [
                     "root_cause",
-                    "parent_hypothetical_action",
-                    "candidate_hypothetical_action",
-                    "hypothetical_action",
-                    "parent_success_prob",
-                    "candidate_success_prob",
-                    "relative_advantage",
-                    "match_score",
+                    "proposer_root_cause_correct",
                     "skill_addresses_root_cause",
-                    "probability_of_success",
-                    "would_succeed",
+                    "failure_mechanism_encoding",
+                    "executable_specificity",
+                    "high_risk_blacklist",
+                    "generalization_transfer",
+                    "set_a_success_prob",
+                    "set_b_success_prob",
+                    "b_over_a_score",
                     "confidence",
                     "remaining_blockers",
                     "reasoning",
@@ -1806,6 +2118,70 @@ and modify it to add these capabilities. Preserve all existing content that is s
         return match_score, parent_prob, candidate_prob, relative_advantage
 
     @staticmethod
+    def _judge_artifact_quality(data: dict[str, Any]) -> float:
+        """Score whether a skill change has the concrete ingredients that predict utility.
+
+        This is intentionally separate from the judge's A/B success estimate. It
+        prevents polished but generic skills from receiving high pairwise credit
+        unless they encode the failure mechanism, executable remedy, and
+        regression blacklist.
+        """
+        mechanism = SelfImprovingLoop._clamp01(
+            data.get("failure_mechanism_encoding"),
+            default=SelfImprovingLoop._clamp01(data.get("skill_addresses_root_cause"), default=0.0),
+        )
+        executable = SelfImprovingLoop._clamp01(data.get("executable_specificity"), default=0.0)
+        blacklist = SelfImprovingLoop._clamp01(data.get("high_risk_blacklist"), default=0.0)
+        transfer = SelfImprovingLoop._clamp01(data.get("generalization_transfer"), default=0.0)
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.35 * mechanism
+                + 0.30 * executable
+                + 0.20 * blacklist
+                + 0.15 * transfer,
+            ),
+        )
+
+    @staticmethod
+    def _apply_artifact_quality_gate(match_score: float, artifact_quality: float) -> float:
+        """Cap candidate wins when the skill lacks concrete utility predictors."""
+        match_score = max(0.0, min(1.0, match_score))
+        artifact_quality = max(0.0, min(1.0, artifact_quality))
+        if match_score <= 0.5:
+            return match_score
+        return 0.5 + (match_score - 0.5) * artifact_quality
+
+    @staticmethod
+    def _canonicalize_judge_orientation(
+        data: dict[str, Any],
+        candidate_slot: str,
+    ) -> dict[str, Any]:
+        """Translate neutral A/B judge output to canonical candidate-vs-parent keys.
+
+        The judge sees two neutral "Skill Set A/B" with the candidate randomly
+        placed in one slot; ``candidate_slot`` records which. This recovers the
+        canonical ``candidate_success_prob`` / ``parent_success_prob`` /
+        ``match_score`` (candidate over parent) by un-swapping, cancelling any
+        fixed-slot position bias. Writes the canonical keys back into ``data``.
+        """
+        sa = SelfImprovingLoop._clamp01(data.get("set_a_success_prob"), default=0.5)
+        sb = SelfImprovingLoop._clamp01(data.get("set_b_success_prob"), default=0.5)
+        b_over_a = SelfImprovingLoop._clamp01(data.get("b_over_a_score"), default=0.5)
+        if candidate_slot == "B":
+            cand_prob, parent_prob, match = sb, sa, b_over_a
+        else:  # candidate placed in Set A
+            cand_prob, parent_prob, match = sa, sb, 1.0 - b_over_a
+        data["candidate_success_prob"] = cand_prob
+        data["parent_success_prob"] = parent_prob
+        data["match_score"] = match
+        data["relative_advantage"] = max(-1.0, min(1.0, cand_prob - parent_prob))
+        data["would_succeed"] = match >= 0.5
+        data["_candidate_slot"] = candidate_slot
+        return data
+
+    @staticmethod
     def _bt_player_uncertainty(
         player: str,
         matches: list[BradleyTerryMatch],
@@ -1977,23 +2353,17 @@ and modify it to add these capabilities. Preserve all existing content that is s
             # Advance even if empty so we don't keep retrying the same type
             self._category_offset += 1
             if ft_failures:
-                offset = self._per_failure_type_offset.get(ft, 0)
                 samples = min(
                     self.config.samples_per_category * self.config.categories_per_batch,
                     len(ft_failures),
                 )
-                batch = [
-                    ft_failures[(offset + k) % len(ft_failures)]
-                    for k in range(samples)
-                ]
-                self._per_failure_type_offset[ft] = offset + samples
-                return batch
+                return self._pick_least_shown(ft_failures, samples)
             # If the chosen type has no failures left, fall through to category path
 
         # --- category-based path (fallback / no failure_type labels) ---
         n_cats = len(categories)
         if n_cats == 0:
-            return failures[: self.config.samples_per_category]
+            return self._pick_least_shown(failures, self.config.samples_per_category)
 
         n_cats_this_iter = min(self.config.categories_per_batch, n_cats)
         batch: list[tuple[Any, ...]] = []
@@ -2002,18 +2372,111 @@ and modify it to add these capabilities. Preserve all existing content that is s
             cat = categories[cat_idx]
             cat_failures = [f for f in failures if f[4] == cat]
             samples_to_take = min(self.config.samples_per_category, len(cat_failures))
-            offset = self._per_cat_offset.get(cat, 0)
-            for k in range(samples_to_take):
-                idx = (offset + k) % len(cat_failures) if cat_failures else 0
-                if idx < len(cat_failures):
-                    batch.append(cat_failures[idx])
-            if cat_failures:
-                self._per_cat_offset[cat] = offset + samples_to_take
+            batch.extend(self._pick_least_shown(cat_failures, samples_to_take))
         self._category_offset += n_cats_this_iter
 
         if not batch:
-            return failures[: self.config.samples_per_category]
+            return self._pick_least_shown(failures, self.config.samples_per_category)
         return batch
+
+    def _pick_least_shown(
+        self,
+        pool: list[tuple[Any, ...]],
+        n: int,
+    ) -> list[tuple[Any, ...]]:
+        """Pick ``n`` least-recently-shown failures from ``pool`` and mark them.
+
+        A stable sort by per-question show-count keeps original order as the
+        tiebreak, so the first call returns items [0, 1], the next returns the
+        still-unshown [2, 3], and so on — sweeping all distinct failures before
+        repeating any. Show-counts are incremented for the picked items.
+        """
+        if n <= 0 or not pool:
+            return []
+        ordered = sorted(pool, key=lambda f: self._failure_shown_count.get(str(f[1]), 0))
+        picked = ordered[: min(n, len(ordered))]
+        for entry in picked:
+            key = str(entry[1])
+            self._failure_shown_count[key] = self._failure_shown_count.get(key, 0) + 1
+        return picked
+
+    def _split_holdout(
+        self,
+        failures_ext: list[tuple[Any, ...]],
+    ) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        """Partition failures (per category) into a proposer-visible pool and a
+        disjoint judge-only pool.
+
+        The proposer only ever sees the first pool, while candidates are scored
+        on the second. This stops a proposal from being graded on the very cases
+        it was written against (memorization / overfitting). Categories with a
+        single failure are kept proposer-visible; if no held-out case exists at
+        all, both pools fall back to the full set so scoring still has signal.
+        """
+        ratio = max(0.0, min(0.9, self.config.judge_holdout_ratio))
+        if ratio <= 0.0 or len(failures_ext) < 2:
+            return failures_ext, failures_ext
+
+        import random as _random
+
+        by_cat: dict[str, list[tuple[Any, ...]]] = {}
+        for entry in failures_ext:
+            by_cat.setdefault(entry[4], []).append(entry)
+
+        proposer_pool: list[tuple[Any, ...]] = []
+        judge_pool: list[tuple[Any, ...]] = []
+        for cat in sorted(by_cat):
+            items = list(by_cat[cat])
+            _random.Random(f"holdout::{cat}").shuffle(items)
+            if len(items) < 2:
+                proposer_pool.extend(items)
+                continue
+            n_judge = max(1, round(len(items) * ratio))
+            n_judge = min(n_judge, len(items) - 1)  # always leave >=1 to propose on
+            judge_pool.extend(items[:n_judge])
+            proposer_pool.extend(items[n_judge:])
+
+        if not judge_pool:
+            return failures_ext, failures_ext
+        return proposer_pool, judge_pool
+
+    def _sample_judge_failures(
+        self,
+        judge_pool: list[tuple[Any, ...]],
+        batch_categories: list[str],
+        count: int,
+    ) -> list[tuple[Any, ...]]:
+        """Rotating sample of held-out failures for judging, aligned to the
+        categories the proposer batch targeted so the comparison stays on-topic.
+
+        Uses an offset table separate from proposer sampling so the two never
+        advance in lockstep.
+        """
+        if not judge_pool or count <= 0:
+            return []
+        by_cat: dict[str, list[tuple[Any, ...]]] = {}
+        for entry in judge_pool:
+            by_cat.setdefault(entry[4], []).append(entry)
+        cats = [c for c in dict.fromkeys(batch_categories) if c in by_cat] or sorted(by_cat)
+
+        selected: list[tuple[Any, ...]] = []
+        seen: set[str] = set()
+        i = 0
+        guard = 0
+        max_guard = count * 4 + len(judge_pool)
+        while len(selected) < count and guard < max_guard:
+            cat = cats[i % len(cats)]
+            pool = by_cat[cat]
+            off = self._judge_cat_offset.get(cat, 0)
+            cand = pool[off % len(pool)]
+            self._judge_cat_offset[cat] = off + 1
+            key = str(cand[1])
+            if key not in seen:
+                seen.add(key)
+                selected.append(cand)
+            i += 1
+            guard += 1
+        return selected
 
     def _add_puct_child(
         self,
@@ -2091,28 +2554,95 @@ and modify it to add these capabilities. Preserve all existing content that is s
         model: str,
         child_name: str = "candidate",
         parent_name: str = "parent",
-        proposal: str = "",
-        justification: str = "",
-        proposer_root_cause_analysis: str = "",
-        proposer_coverage_plan: str = "",
-        proposer_regression_risks: str = "",
         parent_skill_summary: str = "",
         candidate_skill_summary: str = "",
         skill_diff: str = "",
-        candidate_skills_content: str = "",
+        skill_diff_swapped: str = "",
+        proposer_root_cause: str = "",
     ) -> JudgeResult:
-        """Estimate failure-recovery quality with LLM-judged Elo matches.
+        """Estimate failure-recovery quality with LLM-judged pairwise matches.
 
-        Makes one lightweight API call per failure (no agent re-run).
+        Makes one lightweight API call per case (no agent re-run). The judge
+        sees only the concrete skill diff/summaries — never the proposer's own
+        rationale — so it cannot rubber-stamp the proposal's claims.
         Returns Elo ratings plus a calibrated failure-fix estimate in [0, 1].
+
+        Position de-bias: the candidate is randomly assigned to neutral Skill Set
+        A or B per case (``judge_randomize_orientation``) in a single call, and the
+        canonical candidate-vs-parent score is recovered by un-swapping — turning a
+        fixed-slot bias into zero-mean noise at no extra cost. ``judge_position_swap``
+        instead judges both orientations and averages (2x calls) and takes
+        precedence when set. The "Change Being Evaluated" shown to the judge is
+        always the candidate's natural diff, independent of slot, so the
+        root-cause-fit fields stay correct in either orientation.
         """
         import json
-        skills_content = candidate_skills_content or self._get_all_skills_content()
+        import random as _random
+        parent_skill_summary = self._compact_judge_text(parent_skill_summary, max_chars=2500)
+        candidate_skill_summary = self._compact_judge_text(candidate_skill_summary, max_chars=2500)
+        skill_diff = self._compact_judge_text(skill_diff, max_chars=3200)
+        proposer_root_cause = self._compact_judge_text(proposer_root_cause, max_chars=1200)
         semaphore = asyncio.Semaphore(self.config.judge_concurrency)
         child_rating = self.config.judge_elo_initial_rating
         opponent_rating = self.config.judge_elo_initial_rating
         scale = self.config.judge_elo_scale
         k_factor = self.config.judge_elo_k
+
+        async def call_orientation(
+            trace_summary: str,
+            q: str,
+            ans: str,
+            gt: str,
+            case_type: str,
+            case_feedback: str,
+            *,
+            a_summary: str,
+            b_summary: str,
+            diff: str,
+        ) -> dict[str, Any] | None:
+            """One judge API call for a single A/B orientation. Returns parsed
+            JSON (with A in the parent slot, B in the candidate slot) or None on
+            failure."""
+            prompt = build_judge_query(
+                trace_summary,
+                q,
+                ans,
+                gt,
+                parent_skill_summary=a_summary,
+                candidate_skill_summary=b_summary,
+                skill_diff=diff,
+                case_type=case_type,
+                case_feedback=case_feedback,
+                proposer_root_cause=proposer_root_cause,
+            )
+            prompt = self._compact_judge_text(prompt, max_chars=20000, max_line_chars=1200)
+            try:
+                text = await asyncio.wait_for(
+                    self._call_judge_api(prompt, provider, model),
+                    timeout=self.config.judge_call_timeout_seconds,
+                )
+                text = text.strip()
+                if text.startswith("```"):
+                    text = "\n".join(text.split("\n")[1:])
+                    text = text.rsplit("```", 1)[0].strip()
+                data = json.loads(text)
+                data["_raw_response"] = text
+                return data
+            except Exception as e:
+                _log("WARN", f"  Judge call failed ({type(e).__name__}): {e}")
+                return None
+
+        def _failed_case(index: int, category: str, case_type: str, reason: str) -> dict[str, Any]:
+            return {
+                "_raw_response": "",
+                "_index": index,
+                "_category": f"{category}:regression" if case_type == "regression" else category,
+                "would_succeed": False,
+                "confidence": 0.0,
+                "hypothetical_action": "",
+                "reasoning": reason,
+                "_valid": False,
+            }
 
         async def judge_one(
             index: int,
@@ -2125,52 +2655,83 @@ and modify it to add these capabilities. Preserve all existing content that is s
             case_feedback: str,
         ) -> dict[str, Any]:
             async with semaphore:
-                trace_summary = trace.summarize(head_chars=3000, tail_chars=1500)
-                prompt = build_judge_query(
-                    trace_summary,
-                    question,
-                    agent_answer,
-                    ground_truth,
-                    skills_content,
-                    proposal=proposal,
-                    justification=justification,
-                    proposer_root_cause_analysis=proposer_root_cause_analysis,
-                    proposer_coverage_plan=proposer_coverage_plan,
-                    proposer_regression_risks=proposer_regression_risks,
-                    parent_skill_summary=parent_skill_summary,
-                    candidate_skill_summary=candidate_skill_summary,
-                    skill_diff=skill_diff,
-                    case_type=case_type,
-                    case_feedback=case_feedback,
-                )
-                try:
-                    text = await self._call_judge_api(prompt, provider, model)
-                    text = text.strip()
-                    # Strip markdown code fences if present
-                    if text.startswith("```"):
-                        text = "\n".join(text.split("\n")[1:])
-                        text = text.rsplit("```", 1)[0].strip()
-                    data = json.loads(text)
-                    data["_raw_response"] = text
-                    data["_index"] = index
-                    data["_category"] = (
-                        f"{category}:regression" if case_type == "regression" else category
+                trace_summary = self._summarize_trace_for_judge(trace)
+                q = self._compact_judge_text(question, max_chars=1600)
+                ans = self._compact_judge_text(agent_answer, max_chars=1600)
+                gt = self._compact_judge_text(ground_truth, max_chars=1200)
+                fb = self._compact_judge_text(case_feedback, max_chars=2500)
+
+                async def _orient(candidate_slot: str) -> dict[str, Any] | None:
+                    """One call with the candidate placed in Set A or Set B.
+
+                    The Change Being Evaluated is always the candidate's natural
+                    diff regardless of slot; only the two summaries swap places.
+                    """
+                    if candidate_slot == "B":
+                        a_sum, b_sum = parent_skill_summary, candidate_skill_summary
+                    else:
+                        a_sum, b_sum = candidate_skill_summary, parent_skill_summary
+                    raw = await call_orientation(
+                        trace_summary, q, ans, gt, case_type, fb,
+                        a_summary=a_sum, b_summary=b_sum, diff=skill_diff,
                     )
-                    return data
-                except Exception as e:
-                    _log("WARN", f"  Judge call failed ({type(e).__name__}): {e}")
-                    return {
-                        "_raw_response": "",
-                        "_index": index,
-                        "_category": (
-                            f"{category}:regression" if case_type == "regression" else category
-                        ),
-                        "would_succeed": False,
-                        "confidence": 0.0,
-                        "hypothetical_action": "",
-                        "reasoning": f"Judge call failed: {type(e).__name__}: {e}",
-                        "_valid": False,
-                    }
+                    if raw is None:
+                        return None
+                    return self._canonicalize_judge_orientation(raw, candidate_slot)
+
+                if self.config.judge_position_swap:
+                    # Two complementary orientations, averaged (2x calls).
+                    d_b = await _orient("B")
+                    d_a = await _orient("A")
+                    if d_b is None and d_a is None:
+                        return _failed_case(index, category, case_type, "Judge call failed (both orientations)")
+                    if d_b is None:
+                        data = d_a
+                    elif d_a is None:
+                        data = d_b
+                    else:
+                        data = d_b
+                        match = 0.5 * (d_b["match_score"] + d_a["match_score"])
+                        cp = 0.5 * (d_b["candidate_success_prob"] + d_a["candidate_success_prob"])
+                        pp = 0.5 * (d_b["parent_success_prob"] + d_a["parent_success_prob"])
+                        data["match_score"] = match
+                        data["candidate_success_prob"] = cp
+                        data["parent_success_prob"] = pp
+                        data["relative_advantage"] = max(-1.0, min(1.0, cp - pp))
+                        data["would_succeed"] = match >= 0.5
+                        data["confidence"] = 0.5 * (
+                            self._clamp01(d_b.get("confidence"), default=0.5)
+                            + self._clamp01(d_a.get("confidence"), default=0.5)
+                        )
+                        for fld in (
+                            "skill_addresses_root_cause",
+                            "proposer_root_cause_correct",
+                            "failure_mechanism_encoding",
+                            "executable_specificity",
+                            "high_risk_blacklist",
+                            "generalization_transfer",
+                        ):
+                            data[fld] = 0.5 * (
+                                self._clamp01(d_b.get(fld), default=0.0)
+                                + self._clamp01(d_a.get(fld), default=0.0)
+                            )
+                        data["_position_averaged"] = True
+                else:
+                    # Single call; randomize the candidate's slot to de-bias.
+                    if self.config.judge_randomize_orientation:
+                        rng = _random.Random(f"orient::{child_name}::{index}")
+                        candidate_slot = rng.choice(["A", "B"])
+                    else:
+                        candidate_slot = "B"
+                    data = await _orient(candidate_slot)
+                    if data is None:
+                        return _failed_case(index, category, case_type, "Judge call failed")
+
+                data["_index"] = index
+                data["_category"] = (
+                    f"{category}:regression" if case_type == "regression" else category
+                )
+                return data
 
         raw_results = []
         judge_tasks = []
@@ -2228,9 +2789,6 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 or "candidate_success_prob" in data
                 or "relative_advantage" in data
             )
-            parent_success_prob = 0.0
-            candidate_success_prob = 0.0
-            relative_advantage = 0.0
             if has_relative_score:
                 (
                     match_score,
@@ -2238,30 +2796,27 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     candidate_success_prob,
                     relative_advantage,
                 ) = self._judge_relative_to_match_score(data)
-            elif (
-                "probability_of_success" in data
-                or "skill_addresses_root_cause" in data
-            ):
-                match_score = self._judge_probability_to_match_score(
-                    data.get("probability_of_success"),
-                    data.get("skill_addresses_root_cause"),
-                )
-                candidate_success_prob = self._clamp01(
-                    data.get("probability_of_success"),
-                    default=match_score,
-                )
-                parent_success_prob = 0.5
-                relative_advantage = 2.0 * (match_score - 0.5)
-            elif self.config.judge_scoring == "average":
-                match_score = confidence if would_succeed else 0.0
-                candidate_success_prob = match_score
-                parent_success_prob = 0.5
-                relative_advantage = 2.0 * (match_score - 0.5)
             else:
-                match_score = self._judge_binary_to_match_score(would_succeed, confidence)
-                candidate_success_prob = match_score
+                # No pairwise signal from the judge. Treat as a draw rather than
+                # assuming an optimistic baseline (e.g. parent=0.5,
+                # candidate=confidence), which systematically inflated every
+                # child above its parent regardless of real merit.
+                match_score = 0.5
                 parent_success_prob = 0.5
-                relative_advantage = 2.0 * (match_score - 0.5)
+                candidate_success_prob = 0.5
+                relative_advantage = 0.0
+            failure_mechanism_encoding = self._clamp01(
+                data.get("failure_mechanism_encoding"),
+                default=self._clamp01(data.get("skill_addresses_root_cause"), default=0.0),
+            )
+            executable_specificity = self._clamp01(data.get("executable_specificity"), default=0.0)
+            high_risk_blacklist = self._clamp01(data.get("high_risk_blacklist"), default=0.0)
+            generalization_transfer = self._clamp01(data.get("generalization_transfer"), default=0.5)
+            artifact_quality = self._judge_artifact_quality(data)
+            gated_match_score = self._apply_artifact_quality_gate(match_score, artifact_quality)
+            if gated_match_score != match_score:
+                match_score = gated_match_score
+                relative_advantage = max(-1.0, min(1.0, 2.0 * (match_score - 0.5)))
 
             expected_before = self._elo_expected(_initial_child_rating, _initial_opponent_rating, scale)
             child_rating += k_factor * (match_score - expected_before)
@@ -2290,6 +2845,14 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     data.get("skill_addresses_root_cause"),
                     default=0.0,
                 ),
+                proposer_root_cause_correct=self._clamp01(
+                    data.get("proposer_root_cause_correct"),
+                    default=0.0,
+                ),
+                failure_mechanism_encoding=failure_mechanism_encoding,
+                executable_specificity=executable_specificity,
+                high_risk_blacklist=high_risk_blacklist,
+                generalization_transfer=generalization_transfer,
                 probability_of_success=self._clamp01(
                     data.get("probability_of_success"),
                     default=candidate_success_prob,
@@ -2318,7 +2881,12 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         f"p_parent={result.parent_success_prob:.3f} "
                         f"p_candidate={result.candidate_success_prob:.3f} "
                         f"rel_adv={result.relative_advantage:.3f} "
-                        f"root_fit={result.skill_addresses_root_cause:.3f}"
+                        f"root_fit={result.skill_addresses_root_cause:.3f} "
+                        f"rc_correct={result.proposer_root_cause_correct:.3f} "
+                        f"mechanism={result.failure_mechanism_encoding:.3f} "
+                        f"exec={result.executable_specificity:.3f} "
+                        f"blacklist={result.high_risk_blacklist:.3f} "
+                        f"transfer={result.generalization_transfer:.3f}"
                     ),
                 )
                 if result.root_cause:
@@ -2359,6 +2927,256 @@ and modify it to add these capabilities. Preserve all existing content that is s
             matches=matches,
             uncertainty=uncertainty,
         )
+
+    @staticmethod
+    def _summarize_judge_feedback(
+        judge_result: "JudgeResult | None",
+    ) -> tuple[str, list[str]]:
+        """Distill a judge result into (root_cause, remaining_blockers) for the
+        feedback history, so the next proposer sees *why* a proposal fell short
+        rather than only its score.
+
+        Blockers are drawn preferentially from the cases the candidate helped
+        least (lowest match_score), since those are the unresolved failures the
+        next iteration should target.
+        """
+        if judge_result is None or not judge_result.matches:
+            return "", []
+
+        matches = [m for m in judge_result.matches if getattr(m, "valid", True)]
+        if not matches:
+            matches = list(judge_result.matches)
+        ordered = sorted(matches, key=lambda m: m.match_score)
+
+        # Representative root cause: from the weakest-improvement case.
+        root_cause = ""
+        for m in ordered:
+            if m.root_cause and m.root_cause.strip():
+                root_cause = m.root_cause.strip()
+                break
+
+        # Union of blockers, weakest cases first, deduped (case-insensitive), capped.
+        blockers: list[str] = []
+        seen: set[str] = set()
+        for m in ordered:
+            for b in m.remaining_blockers:
+                text = str(b).strip()
+                key = text.lower()
+                if text and key not in seen:
+                    seen.add(key)
+                    blockers.append(text)
+                if len(blockers) >= 5:
+                    return root_cause, blockers
+        return root_cause, blockers
+
+    @staticmethod
+    def _mean_root_cause_fit(judge_result: "JudgeResult") -> float:
+        """Mean judge-assessed root-cause-fit over valid matches in [0, 1]."""
+        fits = [
+            m.skill_addresses_root_cause
+            for m in judge_result.matches
+            if getattr(m, "valid", True)
+        ]
+        return sum(fits) / len(fits) if fits else 0.0
+
+    @staticmethod
+    def _weakest_case_reasoning(judge_result: "JudgeResult") -> str:
+        """One-line judge reasoning from the case the candidate helped least."""
+        valid = [m for m in judge_result.matches if getattr(m, "valid", True)]
+        if not valid:
+            return ""
+        weakest = min(valid, key=lambda m: m.match_score)
+        return weakest.reasoning or ""
+
+    @staticmethod
+    def _mean_generalization_transfer(judge_result: "JudgeResult") -> float:
+        """Mean judge-estimated transferability over valid cases."""
+        transfers = [
+            max(0.0, min(1.0, getattr(m, "generalization_transfer", 0.5)))
+            for m in judge_result.matches
+            if getattr(m, "valid", True)
+        ]
+        return sum(transfers) / len(transfers) if transfers else 0.0
+
+    @staticmethod
+    def _has_misleading_worked_example(markdown: str) -> bool:
+        """Detect a worked example that emits a scaffold count as the final answer.
+
+        Flags the failure mode (e.g. UID0149) where a grid-size self-check such as
+        ``ledger_count_check: 7 x 2 = 14`` shares its value with the example's
+        stated ``Answer:`` / ``final_answer:`` — i.e. the agent would report the
+        grid size instead of the predicate-satisfying subset count.
+        """
+        import re
+
+        if not markdown:
+            return False
+
+        def _last_number(text: str) -> str | None:
+            nums = re.findall(r"-?\d[\d,]*(?:\.\d+)?", text.replace(",", ""))
+            return nums[-1] if nums else None
+
+        scaffold_values: set[str] = set()
+        answer_values: set[str] = set()
+        scaffold_re = re.compile(
+            r"(?im)^\s*(?:ledger_count_check|expected[\w ]*count|expected\b.*\btests?)\b.*$"
+        )
+        grid_re = re.compile(r"(?i)\b\d+\s*[x*×]\s*\d+\s*=\s*(\d[\d,]*)")
+        answer_re = re.compile(r"(?im)^\s*(?:final_answer|answer)\s*[:=]\s*(.+)$")
+
+        for line in markdown.splitlines():
+            if scaffold_re.match(line):
+                val = _last_number(line)
+                if val is not None:
+                    scaffold_values.add(val)
+            for m in grid_re.finditer(line):
+                scaffold_values.add(m.group(1).replace(",", ""))
+            am = answer_re.match(line)
+            if am:
+                val = _last_number(am.group(1))
+                if val is not None:
+                    answer_values.add(val)
+
+        return bool(scaffold_values & answer_values)
+
+    def _snapshot_skill_files(self) -> dict[str, bytes]:
+        """Capture current SKILL.md bytes so a failed revision can be rolled back."""
+        skills_dir = self._project_root / ".claude" / "skills"
+        snapshot: dict[str, bytes] = {}
+        if skills_dir.exists():
+            for path in skills_dir.rglob("SKILL.md"):
+                snapshot[str(path)] = path.read_bytes()
+        return snapshot
+
+    def _restore_skill_files(self, snapshot: dict[str, bytes]) -> None:
+        """Restore SKILL.md files captured by ``_snapshot_skill_files``."""
+        for path_str, data in snapshot.items():
+            path = Path(path_str)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+    async def _refine_child_once(
+        self,
+        *,
+        child_name: str,
+        parent: str,
+        skill_name: str,
+        judge_result: "JudgeResult",
+        scoring_cases_ext: list,
+        judge_provider: str,
+        judge_model: str,
+        parent_skill_summary: str,
+        parent_skills_content: str,
+        proposer_root_cause: str,
+        original_proposal: str,
+    ) -> tuple["JudgeResult", str, str, str, str, bool]:
+        """Revise the child's skill once from the judge's verdict, then re-judge.
+
+        Returns (judge_result, candidate_skills_content, candidate_skill_summary,
+        skill_diff, skill_diff_swapped, revised_kept). The pre-revision skill
+        files and the original judge_result are restored whenever the revision
+        does not improve the average match score vs the parent, so a refine can
+        never lower a child's score.
+        """
+        def _artifacts() -> tuple[str, str, str, str]:
+            content = self._get_all_skills_content()
+            summary = self._summarize_skill_content(content)
+            diff = self._diff_skill_content(parent_skills_content, content)
+            diff_sw = self._diff_skill_content(content, parent_skills_content)
+            return content, summary, diff, diff_sw
+
+        skill_path = (
+            self._project_root / ".claude" / "skills" / skill_name / "SKILL.md"
+            if skill_name
+            else None
+        )
+        if skill_path is None or not skill_path.exists():
+            content, summary, diff, diff_sw = _artifacts()
+            return judge_result, content, summary, diff, diff_sw, False
+
+        judge_root_cause, judge_blockers = self._summarize_judge_feedback(judge_result)
+        judge_reasoning = self._weakest_case_reasoning(judge_result)
+        snapshot = self._snapshot_skill_files()
+        revision_query = build_skill_revision_query(
+            target_skill=skill_name,
+            current_skill_markdown=skill_path.read_text(),
+            proposer_root_cause=proposer_root_cause,
+            original_proposal=original_proposal,
+            judge_root_cause=judge_root_cause,
+            judge_blockers=judge_blockers,
+            judge_reasoning=judge_reasoning,
+        )
+        try:
+            revise_trace = await self.agents.skill_generator.run(revision_query)
+        except Exception as e:  # noqa: BLE001 — generator transport may raise broadly
+            _log("WARN", f"  [REFINE] Generator failed ({type(e).__name__}: {e}); keeping original")
+            content, summary, diff, diff_sw = _artifacts()
+            return judge_result, content, summary, diff, diff_sw, False
+        self._add_iteration_cost(revise_trace.total_cost_usd, "evolution")
+
+        materialized = None
+        if revise_trace.output:
+            materialized = self._materialize_generated_skill(
+                revise_trace.output,
+                action_type="edit",
+                target_skill=skill_name,
+                fallback_description=original_proposal,
+            )
+        if not materialized:
+            _log("", "  [REFINE] No revised SKILL.md produced; keeping original")
+            self._restore_skill_files(snapshot)
+            content, summary, diff, diff_sw = _artifacts()
+            return judge_result, content, summary, diff, diff_sw, False
+
+        rev_content, rev_summary, rev_diff, rev_diff_sw = _artifacts()
+        try:
+            rev_judge = await self._judge_skill_with_llm(
+                scoring_cases_ext,
+                judge_provider,
+                judge_model,
+                child_name=child_name,
+                parent_name=parent,
+                parent_skill_summary=parent_skill_summary,
+                candidate_skill_summary=rev_summary,
+                skill_diff=rev_diff,
+                skill_diff_swapped=rev_diff_sw,
+                proposer_root_cause=proposer_root_cause,
+            )
+        except RuntimeError as e:
+            _log("WARN", f"  [REFINE] Re-judge failed ({e}); keeping original")
+            self._restore_skill_files(snapshot)
+            content, summary, diff, diff_sw = _artifacts()
+            return judge_result, content, summary, diff, diff_sw, False
+
+        if rev_judge.average_match_score > judge_result.average_match_score:
+            # Persist the kept revision onto the child's program branch so a later
+            # switch_to(child) (PUCT re-selection or final best extraction) does
+            # not restore the pre-refine version from git.
+            try:
+                self.manager.commit(f"{child_name}: refine {skill_name} (judge feedback)")
+            except Exception as e:  # noqa: BLE001 — commit backends vary
+                _log("WARN", f"  [REFINE] Could not commit revision for {child_name}: {e}")
+            _log(
+                "REFINE",
+                (
+                    f"{child_name}: revision improved avg_match "
+                    f"{judge_result.average_match_score:.3f} -> "
+                    f"{rev_judge.average_match_score:.3f}; kept"
+                ),
+            )
+            return rev_judge, rev_content, rev_summary, rev_diff, rev_diff_sw, True
+
+        _log(
+            "REFINE",
+            (
+                f"{child_name}: revision did not improve "
+                f"({rev_judge.average_match_score:.3f} <= "
+                f"{judge_result.average_match_score:.3f}); reverted"
+            ),
+        )
+        self._restore_skill_files(snapshot)
+        content, summary, diff, diff_sw = _artifacts()
+        return judge_result, content, summary, diff, diff_sw, False
 
     async def _run_with_llm_judge(self) -> LoopResult:
         """LLM Judge mode: collect all trajectories once, then iterate on skill
@@ -2458,7 +3276,19 @@ and modify it to add these capabilities. Preserve all existing content that is s
             "COLLECT",
             f"Base score: {base_score:.4f} ({passed}/{total} passed, {len(all_failures_ext)} failures)",
         )
-        _log("JUDGE", "Using each proposal batch for scoring; no fixed judge set")
+        # Hold out a disjoint slice of failures for judging so candidates are
+        # never scored on the exact cases the proposer was shown.
+        proposer_failures_ext, judge_failures_ext = self._split_holdout(all_failures_ext)
+        if proposer_failures_ext is not judge_failures_ext:
+            _log(
+                "HOLDOUT",
+                f"{len(proposer_failures_ext)} proposer-visible failures / "
+                f"{len(judge_failures_ext)} held-out judge failures "
+                f"(ratio={self.config.judge_holdout_ratio:.2f})",
+            )
+        else:
+            _log("HOLDOUT", "Disabled or too few failures; proposer and judge share all cases")
+        _log("JUDGE", "Judging on held-out failures + inherited parent set")
         self.manager.update_frontier("base", base_score, max_size=self.config.frontier_size)
         self._emit("baseline", score=base_score, n_skills=len(self._get_active_skills()))
         search_root = self._build_program_search_tree(base_score)
@@ -2533,19 +3363,35 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 _log("", "  -> No failures remaining")
                 break
 
+            # The proposer only ever sees the proposer-visible pool.
             batch_failures_ext = self._sample_proposal_failures(
-                all_failures_ext, categories, failure_types
+                proposer_failures_ext, categories, failure_types
             )
-            # Inherit parent's scoring failures so the child is always evaluated
-            # on a superset of the failures the parent was scored on.  This makes
-            # child_score vs parent_score a fair comparison (same evaluation set).
-            scoring_failures_ext = self._merge_scoring_failures(
+            # The judge scores on HELD-OUT failures the proposer never saw, drawn
+            # from the same categories the proposal targeted. Inheriting the
+            # parent's scoring set keeps child_score vs parent_score a fair
+            # comparison on a consistent (held-out) evaluation set.
+            batch_categories = [f[4] for f in batch_failures_ext]
+            judge_batch_ext = self._sample_judge_failures(
+                judge_failures_ext,
+                batch_categories,
+                count=max(len(batch_failures_ext), self.config.failure_sample_count),
+            )
+            # By default the judge scores only this batch's held-out failures
+            # (plus a small regression sample below), not the parent's inherited
+            # superset — inheriting was the dominant judge-call multiplier.
+            inherited_failures = (
                 [
                     entry
                     for entry in parent_node.scoring_failures
                     if self._trajectory_failure_type(entry) != "regression_pass"
-                ],
-                batch_failures_ext,
+                ]
+                if self.config.judge_inherit_parent_failures
+                else []
+            )
+            scoring_failures_ext = self._merge_scoring_failures(
+                inherited_failures,
+                judge_batch_ext,
                 max_size=self.config.samples_per_category * self.config.categories_per_batch * 3,
             )
             regression_cases_ext = self._sample_regression_successes(
@@ -2643,6 +3489,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 parent_skill_summary = self._summarize_skill_content(parent_skills_content)
                 candidate_skill_summary = self._summarize_skill_content(candidate_skills_content)
                 skill_diff = self._diff_skill_content(parent_skills_content, candidate_skills_content)
+                skill_diff_swapped = self._diff_skill_content(candidate_skills_content, parent_skills_content)
 
                 # Judge with LLM — no full agent re-run
                 _log("", f"  -> Judging {child_name} via LLM ({judge_provider}/{judge_model})...")
@@ -2653,63 +3500,165 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         judge_model,
                         child_name=child_name,
                         parent_name=parent,
-                        proposal=proposal,
-                        justification=justification,
-                        proposer_root_cause_analysis=mutation_result.root_cause_analysis,
-                        proposer_coverage_plan=mutation_result.coverage_plan,
-                        proposer_regression_risks=mutation_result.regression_risks,
                         parent_skill_summary=parent_skill_summary,
                         candidate_skill_summary=candidate_skill_summary,
                         skill_diff=skill_diff,
-                        candidate_skills_content=candidate_skills_content,
+                        skill_diff_swapped=skill_diff_swapped,
+                        proposer_root_cause=mutation_result.root_cause_analysis,
                     )
                 except RuntimeError as e:
                     _log("WARN", f"  [WARN] All judge calls failed for {child_name}: {e}; skipping child")
                     continue
 
+                # judge→generator refine loop: when the judge finds the candidate
+                # does not address the true root cause (or does not beat parent),
+                # feed its verdict back to the generator for one targeted revision
+                # and re-judge, keeping the better-scoring version.
+                refine_round = 0
+                while (
+                    self.config.refine_with_judge_feedback
+                    and refine_round < self.config.refine_max_rounds
+                ):
+                    mean_root_fit = self._mean_root_cause_fit(judge_result)
+                    mean_transfer = self._mean_generalization_transfer(judge_result)
+                    misleading_example = (
+                        self.config.validate_worked_examples
+                        and self._has_misleading_worked_example(candidate_skills_content)
+                    )
+                    needs_refine = (
+                        mean_root_fit < self.config.refine_root_cause_threshold
+                        or mean_transfer < self.config.refine_generalization_threshold
+                        or judge_result.average_match_score <= 0.5
+                        or misleading_example
+                    )
+                    if not needs_refine:
+                        break
+                    if misleading_example:
+                        _log(
+                            "REFINE",
+                            f"{child_name}: worked example emits a scaffold count as the answer "
+                            "-> revising",
+                        )
+                    _log(
+                        "REFINE",
+                        (
+                            f"{child_name}: root_fit={mean_root_fit:.3f} "
+                            f"transfer={mean_transfer:.3f} "
+                            f"avg_match={judge_result.average_match_score:.3f} "
+                            f"-> revising (round {refine_round + 1}/{self.config.refine_max_rounds})"
+                        ),
+                    )
+                    (
+                        judge_result,
+                        candidate_skills_content,
+                        candidate_skill_summary,
+                        skill_diff,
+                        skill_diff_swapped,
+                        revised_kept,
+                    ) = await self._refine_child_once(
+                        child_name=child_name,
+                        parent=parent,
+                        skill_name=mutation_result.skill_name,
+                        judge_result=judge_result,
+                        scoring_cases_ext=scoring_cases_ext,
+                        judge_provider=judge_provider,
+                        judge_model=judge_model,
+                        parent_skill_summary=parent_skill_summary,
+                        parent_skills_content=parent_skills_content,
+                        proposer_root_cause=mutation_result.root_cause_analysis,
+                        original_proposal=proposal,
+                    )
+                    refine_round += 1
+                    if not revised_kept:
+                        break
+
                 # Estimate total score: Elo-estimated fix rate is the fraction of
                 # failed samples the child is expected to recover. Scale it to the
                 # observed base-score space.
+                forced_discard = False
                 if self.config.judge_scoring == "bradley_terry":
-                    anchors = self._select_bt_anchor_nodes(parent, child_name)
-                    anchor_results: list[tuple[str, JudgeResult]] = [(parent, judge_result)]
-                    extra_anchors = [anchor for anchor in anchors if anchor != parent]
-                    if extra_anchors:
-                        _log("JUDGE", f"BT anchors for {child_name}: {', '.join(anchors)}")
-                    for anchor in extra_anchors:
+                    async def _judge_vs_anchor(anchor_name: str) -> "JudgeResult | None":
                         anchor_skills_content = self._get_program_skills_content(
-                            anchor,
+                            anchor_name,
                             restore_to=child_name,
                         )
-                        anchor_skill_summary = self._summarize_skill_content(anchor_skills_content)
-                        anchor_diff = self._diff_skill_content(
-                            anchor_skills_content,
-                            candidate_skills_content,
-                        )
-                        _log("", f"  -> Anchor judging {child_name} vs {anchor}...")
+                        a_summary = self._summarize_skill_content(anchor_skills_content)
+                        a_diff = self._diff_skill_content(anchor_skills_content, candidate_skills_content)
+                        a_diff_sw = self._diff_skill_content(candidate_skills_content, anchor_skills_content)
+                        _log("", f"  -> Judging {child_name} vs {anchor_name}...")
                         try:
-                            anchor_result = await self._judge_skill_with_llm(
+                            return await self._judge_skill_with_llm(
                                 scoring_cases_ext,
                                 judge_provider,
                                 judge_model,
                                 child_name=child_name,
-                                parent_name=anchor,
-                                proposal=proposal,
-                                justification=justification,
-                                proposer_root_cause_analysis=mutation_result.root_cause_analysis,
-                                proposer_coverage_plan=mutation_result.coverage_plan,
-                                proposer_regression_risks=mutation_result.regression_risks,
-                                parent_skill_summary=anchor_skill_summary,
+                                parent_name=anchor_name,
+                                parent_skill_summary=a_summary,
                                 candidate_skill_summary=candidate_skill_summary,
-                                skill_diff=anchor_diff,
-                                candidate_skills_content=candidate_skills_content,
+                                skill_diff=a_diff,
+                                skill_diff_swapped=a_diff_sw,
+                                proposer_root_cause=mutation_result.root_cause_analysis,
                             )
                         except RuntimeError as e:
-                            _log("WARN", f"  [WARN] Anchor judge failed ({child_name} vs {anchor}): {e}; skipping anchor")
-                            continue
-                        anchor_results.append((anchor, anchor_result))
+                            _log("WARN", f"  [WARN] Anchor judge failed ({child_name} vs {anchor_name}): {e}; skipping")
+                            return None
 
-                    bt_players.update({child_name, *anchors})
+                    # The parent edge is free — already judged for the refine loop.
+                    anchor_results: list[tuple[str, JudgeResult]] = [(parent, judge_result)]
+                    used_anchors: set[str] = {parent}
+
+                    if self.config.judge_champion_gate:
+                        # Stage 1: duel the current frontier champion.
+                        champion = self.manager.get_best_from_frontier() or "base"
+                        if champion == child_name:
+                            champion = "base"
+                        if champion == parent:
+                            champ_result: "JudgeResult | None" = judge_result
+                        else:
+                            champ_result = await _judge_vs_anchor(champion)
+                            if champ_result is not None:
+                                anchor_results.append((champion, champ_result))
+                                used_anchors.add(champion)
+                        decision = self._duel_decision(champ_result)
+                        champ_match = (
+                            f"{champ_result.average_match_score:.3f}"
+                            if champ_result is not None
+                            else "n/a"
+                        )
+                        _log(
+                            "JUDGE",
+                            f"{child_name} vs champion {champion}: duel={decision} "
+                            f"(avg_match={champ_match})",
+                        )
+                        if decision == "loss":
+                            # Clearly worse than the champion → eliminate after one duel.
+                            forced_discard = True
+                        elif decision == "close":
+                            # Stage 2: a few random frontier members to disambiguate.
+                            extra = self._random_frontier_anchors(
+                                used_anchors | {child_name},
+                                self.config.judge_stage2_anchors,
+                            )
+                            if extra:
+                                _log("JUDGE", f"Close duel; extra frontier PKs: {', '.join(extra)}")
+                            for anchor in extra:
+                                r = await _judge_vs_anchor(anchor)
+                                if r is not None:
+                                    anchor_results.append((anchor, r))
+                                    used_anchors.add(anchor)
+                        # decision == "win": champion edge is decisive; no extra PKs.
+                    else:
+                        # Legacy fixed anchor set (parent + frontier best).
+                        for anchor in self._select_bt_anchor_nodes(parent, child_name):
+                            if anchor in used_anchors:
+                                continue
+                            r = await _judge_vs_anchor(anchor)
+                            if r is not None:
+                                anchor_results.append((anchor, r))
+                                used_anchors.add(anchor)
+
+                    anchors = sorted(used_anchors)
+                    bt_players.update({child_name, *used_anchors})
                     bt_player_judge_results[child_name] = judge_result
                     new_bt_matches = [
                         BradleyTerryMatch(
@@ -2785,7 +3734,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
                                 ),
                             )
                         )
-                        if rated_name == child_name or rated_name in existing_frontier_names:
+                        # A clear-loss child is eliminated: keep it out of the
+                        # frontier even if its rating lands acceptably.
+                        if (rated_name == child_name and not forced_discard) or (
+                            rated_name in existing_frontier_names
+                        ):
                             self.manager.update_frontier(
                                 rated_name,
                                 rated_score,
@@ -2817,7 +3770,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         ),
                     )
                 else:
-                    child_score = base_score + judge_result.estimated_fix_rate * (1.0 - base_score)
+                    # Map the child-vs-parent rating advantage symmetrically so a
+                    # child judged worse than its parent can score BELOW base. The
+                    # old `base + fix_rate*(1-base)` floored every child at base and
+                    # made the frontier rise monotonically by construction.
+                    child_score = self._rating_to_score(
+                        judge_result.child_rating,
+                        judge_result.opponent_rating,
+                        base_score,
+                        self.config.judge_elo_scale,
+                    )
                     _log(
                         "",
                         (
@@ -2829,18 +3791,22 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         ),
                     )
 
-                added = self.manager.update_frontier(child_name, child_score, max_size=self.config.frontier_size)
-
-                if added:
-                    outcome = "improved" if child_score > parent_score else "kept"
-                    _log("", f"  [OK] Added to frontier (score: {child_score:.4f})")
+                if forced_discard:
+                    added = False
+                    outcome = "duel_loss"
+                    _log("", f"  [DUEL-LOSS] {child_name} lost to champion (score: {child_score:.4f}); eliminated")
                 else:
-                    outcome = "not_frontier"
-                    _log("", f"  [SKIP] Not added to frontier (score: {child_score:.4f}); kept for PUCT exploration")
+                    added = self.manager.update_frontier(child_name, child_score, max_size=self.config.frontier_size)
+                    if added:
+                        outcome = "improved" if child_score > parent_score else "kept"
+                        _log("", f"  [OK] Added to frontier (score: {child_score:.4f})")
+                    else:
+                        outcome = "not_frontier"
+                        _log("", f"  [SKIP] Not added to frontier (score: {child_score:.4f}); kept for PUCT exploration")
 
-                # Mark node as discarded when it scores clearly below base so PUCT
-                # stops revisiting a dead branch.
-                is_discarded = child_score < base_score - 0.05
+                # Mark node as discarded when it lost its champion duel or scores
+                # clearly below base, so PUCT stops revisiting a dead branch.
+                is_discarded = forced_discard or child_score < base_score - 0.05
                 child_node = self._add_puct_child(
                     parent_node,
                     child_name,
@@ -2871,6 +3837,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     frontier=self.manager.get_frontier_with_scores(),
                     n_skills=len(self._get_active_skills()),
                 )
+                judge_root_cause, judge_blockers = self._summarize_judge_feedback(judge_result)
                 append_feedback(
                     self._feedback_path,
                     child_name,
@@ -2880,6 +3847,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     score=child_score,
                     parent_score=parent_score,
                     active_skills=self._get_active_skills(),
+                    root_cause=judge_root_cause or None,
+                    remaining_blockers=judge_blockers or None,
                 )
 
             _frontier_after = self.manager.get_frontier_with_scores()
