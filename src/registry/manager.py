@@ -360,6 +360,21 @@ class ProgramManager:
             return random.choice(scored)[0]
         if strategy == "round_robin":
             return scored[iteration % len(scored)][0]
+        if strategy == "niche":
+            # Rotate through the distinct niche elites so the search develops
+            # category specialists, not just the average-best program. Falls back
+            # to scalar order when no vectors are present.
+            with_vec = self.get_frontier_with_vectors()
+            niche_best: dict[str, tuple[str, float]] = {}
+            for n, s, vec in with_vec:
+                for niche, acc in vec.items():
+                    cur = niche_best.get(niche)
+                    if cur is None or acc > cur[1]:
+                        niche_best[niche] = (n, acc)
+            elites = sorted({n for n, _ in niche_best.values()})
+            if elites:
+                return elites[iteration % len(elites)]
+            return scored[iteration % len(scored)][0]
         # Default: "best"
         return scored[0][0]
 
@@ -428,6 +443,86 @@ class ProgramManager:
             return True
 
         return False
+
+    def get_frontier_with_vectors(self) -> list[tuple[str, float, dict[str, float]]]:
+        """Frontier programs with scalar score and per-category coverage vector.
+
+        Returns (name, score, vector) tuples; programs without a score are
+        skipped. Used by the quality-diversity frontier (Phase 2).
+        """
+        out: list[tuple[str, float, dict[str, float]]] = []
+        for name in self.get_frontier():
+            try:
+                config = self._read_config_from_branch(f"{self.BRANCH_PREFIX}{name}")
+                score = config.get_score()
+                if score is None:
+                    continue
+                out.append((name, score, config.get_score_vector()))
+            except Exception:
+                continue
+        return out
+
+    def update_frontier_qd(
+        self, name: str, score: float, vector: dict[str, float]
+    ) -> bool:
+        """Quality-diversity frontier update (MAP-Elites-lite).
+
+        Stores the program's scalar score and per-category coverage vector, then
+        recomputes the elite set: the best program per category niche plus the
+        global best by scalar score. Programs that are nobody's elite are dropped
+        from the frontier. This preserves category specialists that a scalar
+        top-k frontier would crowd out.
+
+        Returns True if ``name`` ends up in the elite set, else False (and the
+        caller may discard it).
+        """
+        # Persist score + vector onto the program's config.
+        current_branch = self._git_current_branch()
+        target_branch = f"{self.BRANCH_PREFIX}{name}"
+        if current_branch != target_branch:
+            self._git_checkout(target_branch)
+        config = self._read_config()
+        config = config.with_score(score).with_score_vector(vector)
+        self._write_config(config)
+        self._git_add(self.PROGRAM_FILE)
+        self._git_commit(f"Update score+vector: {score:.4f}")
+        if current_branch != target_branch:
+            self._git_checkout(current_branch)
+
+        # Candidate pool = existing frontier (with vectors) plus this program.
+        pool: dict[str, tuple[float, dict[str, float]]] = {
+            n: (s, v) for n, s, v in self.get_frontier_with_vectors()
+        }
+        pool[name] = (score, dict(vector))
+
+        # Elite set: per-niche argmax(coverage) + global best by scalar score.
+        niches: set[str] = set()
+        for _, (_, vec) in pool.items():
+            niches.update(vec.keys())
+
+        elites: set[str] = set()
+        for niche in niches:
+            best_name = None
+            best_acc = float("-inf")
+            for n, (_, vec) in pool.items():
+                acc = vec.get(niche)
+                if acc is not None and acc > best_acc:
+                    best_acc = acc
+                    best_name = n
+            if best_name is not None:
+                elites.add(best_name)
+        # Global best by scalar score is always an elite (covers no-vector case).
+        global_best = max(pool.items(), key=lambda kv: kv[1][0])[0]
+        elites.add(global_best)
+
+        # Reconcile git tags with the elite set.
+        currently = set(self.get_frontier())
+        for n in currently - elites:
+            self.unmark_frontier(n)
+        for n in elites - currently:
+            self.mark_frontier(n)
+
+        return name in elites
 
     def commit(self, message: str | None = None) -> bool:
         """

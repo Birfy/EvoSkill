@@ -60,6 +60,15 @@ class ProgramConfig(BaseModel):
         """Get the score from metadata, or None if not set."""
         return self.metadata.get("score")
 
+    def with_score_vector(self, vector: dict[str, float]) -> "ProgramConfig":
+        """Return a copy with a per-category coverage vector (Phase 2 QD frontier)."""
+        return self.with_metadata(score_vector=dict(vector))
+
+    def get_score_vector(self) -> dict[str, float]:
+        """Get the per-category coverage vector, or {} if not set."""
+        vec = self.metadata.get("score_vector")
+        return dict(vec) if isinstance(vec, dict) else {}
+
     def mutate(
         self,
         name: str,

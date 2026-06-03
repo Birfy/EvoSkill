@@ -6,8 +6,10 @@ from typing import Literal
 
 
 EvolutionMode = Literal["prompt_only", "skill_only"]
-SelectionStrategy = Literal["best", "random", "round_robin"]
+SelectionStrategy = Literal["best", "random", "round_robin", "niche"]
 JudgeScoring = Literal["elo", "average", "bradley_terry"]
+FailureSelection = Literal["round_robin", "bandit"]
+FrontierMode = Literal["scalar", "qd"]
 
 
 @dataclass
@@ -93,6 +95,11 @@ class LoopConfig:
     judge_model: str | None = None
     judge_concurrency: int = 8
     judge_call_timeout_seconds: int = 180
+    # Max output tokens for a direct judge completion. The judge prompt asks the
+    # model to independently re-derive the earliest divergent step, verify the
+    # proposer's root cause, and emit a multi-field JSON verdict; 512 tokens
+    # forced it to shortcut that reasoning. Raise for higher-fidelity verdicts.
+    judge_max_output_tokens: int = 1536
     # Judge scoring mode. "elo" treats each judged failure as a pairwise match
     # between the child program and the baseline/parent behavior.
     # "bradley_terry" stores all pairwise match records in one global league
@@ -120,6 +127,12 @@ class LoopConfig:
     # keeps frontier selection from over-trusting nodes with only a few judged
     # comparisons or uncertain judge outputs.
     judge_bt_uncertainty_penalty: float = 0.05
+    # Asymmetric regression penalty. Breaking a case that was already correct is
+    # worse than fixing a new failure is good, so when the candidate scores below
+    # 0.5 on a regression case (likely broke it) the below-0.5 deviation is
+    # amplified by this factor before it enters the average / Bradley-Terry match.
+    # 1.0 keeps the old symmetric behavior.
+    judge_regression_penalty_weight: float = 1.5
     judge_log_details: bool = True
     # Hold out a fraction of failures (per category) so the judge scores
     # candidates ONLY on cases the proposer never saw. This prevents the
@@ -153,6 +166,17 @@ class LoopConfig:
     # files, entities, tools, environments, formats, constants, or neighboring
     # operations from the same failure family.
     refine_generalization_threshold: float = 0.55
+    # Trigger a judge-feedback revision when the generator did not provide a
+    # meaningful portable synthetic test suite for the candidate skill, or when
+    # the judge estimates those tests would not actually pass.
+    refine_self_test_threshold: float = 0.55
+    # Execute generator-produced SKILL_TESTS.json as small synthetic agent tasks
+    # against the candidate program before LLM judging. The resulting measured
+    # pass rate overrides the judge's static self_test_pass_rate estimate.
+    executable_skill_tests: bool = True
+    executable_skill_test_max_cases: int = 4
+    executable_skill_test_concurrency: int = 2
+    executable_skill_test_timeout_seconds: int = 240
 
     # Champion-gated staged dueling (Bradley-Terry mode). A new child first duels
     # the current frontier champion. If it clearly loses (the candidate-vs-champion
@@ -184,6 +208,31 @@ class LoopConfig:
     # the grid size instead of the predicate-satisfying subset count.
     validate_worked_examples: bool = True
 
+    # Skill-modification completeness guards.
+    # On an EDIT, reject (restore + discard) a revision whose SKILL.md shrank
+    # below this fraction of the pre-edit length, or that dropped a section
+    # header the original had — catching silent content loss when the generator
+    # rewrites the whole file instead of preserving still-valid content.
+    skill_edit_min_retention_ratio: float = 0.5
+    # Required SKILL.md section headers (see skill_generator prompt). A created or
+    # edited skill that omits any of these is considered incomplete and triggers
+    # one judge-feedback refine round to fill the gap. Empty list disables.
+    required_skill_sections: tuple[str, ...] = (
+        "When To Use",
+        "Do Not Use",
+        "Failure Mechanism",
+        "Procedure",
+        "Invariants",
+        "High-Risk Operations",
+        "Regression Risks",
+    )
+    enforce_skill_sections: bool = True
+    # Active-skill budget. When the number of project skills reaches this, the
+    # proposer is told to EDIT an existing skill rather than CREATE a new one, so
+    # the skills directory does not bloat (every skill is read by the base agent
+    # on each run, inviting over-triggering and context dilution). 0 = unlimited.
+    max_active_skills: int = 8
+
     # Failure detection threshold used in standard (non-judge) mode.
     # A sample with score below this value is treated as a failure and
     # forwarded to the proposer.  Decoupled from tolerance so both can
@@ -195,3 +244,39 @@ class LoopConfig:
     # keywords that trigger them.  None → use the built-in defaults defined
     # in helpers._DEFAULT_ERROR_SURFACE_HINTS.
     error_surface_hints: dict | None = None
+
+    # --- Phase 3: curriculum bandit over failure categories ---------------
+    # How the iteration loop picks which categories to sample failures from.
+    # "round_robin" (default) cycles deterministically through categories.
+    # "bandit" weights categories by recent learning gain
+    # (accept_rate * mean_score_delta from feedback outcomes), so effort
+    # concentrates on categories where proposals actually move the score and
+    # away from ones that never improve. Falls back to round-robin until each
+    # category has been tried at least once.
+    failure_selection: FailureSelection = "round_robin"
+    # Exploration floor for the bandit's softmax sampling (epsilon). Keeps
+    # every category reachable even after it accrues a low value.
+    failure_bandit_epsilon: float = 0.15
+    # EMA smoothing for per-category learning-gain value updates.
+    failure_bandit_ema: float = 0.5
+
+    # --- Phase 1: ACE-style bullet playbook + helpful/harmful counters -----
+    # Represent each skill's accumulated rules as an itemized playbook of
+    # bullets, each carrying helpful/harmful counters. Proposals are applied as
+    # small deterministic deltas (add/reinforce/retire) rather than monolithic
+    # rewrites, and bullets that the held-out gate finds harmful are pruned.
+    use_playbook: bool = False
+    # Max bullets kept per skill playbook before lazy pruning (drops bullets
+    # with harmful > helpful first, then least-helpful).
+    playbook_max_bullets: int = 12
+    # Cosine-similarity threshold above which an added bullet is treated as a
+    # reinforcement of an existing one (dedup) instead of a new entry.
+    playbook_dedup_threshold: float = 0.85
+
+    # --- Phase 2: quality-diversity / Pareto frontier ---------------------
+    # "scalar" (default) keeps the top-k-by-average frontier. "qd" keeps one
+    # elite per failure-category niche (MAP-Elites-lite) plus a global best, so
+    # programs that specialize on a single category survive instead of being
+    # crowded out by the average-best program — preserving diversity for the
+    # PUCT/parent search and complementary-skill merges.
+    frontier_mode: FrontierMode = "scalar"

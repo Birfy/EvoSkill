@@ -64,6 +64,8 @@ from src.schemas import (
 )
 
 from .config import LoopConfig
+from .curriculum import CategoryBandit
+from .playbook import apply_playbook_delta, update_bullet_counters
 from .helpers import (
     build_answer_comparison_feedback,
     build_regression_success_feedback,
@@ -114,6 +116,11 @@ class MutationResult:
     coverage_plan: str = ""
     regression_risks: str = ""
     skill_name: str = ""
+    # Phase 1 (playbook mode): the skill whose playbook was edited and the ids of
+    # bullets this proposal added or reinforced, so the loop can credit their
+    # helpful counters once the held-out gate confirms an improvement.
+    target_skill: str = ""
+    credited_bullets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -139,6 +146,7 @@ class LoopResult:
     trajectory_cost_usd: float = 0.0
     preloaded_trajectory_cost_usd: float = 0.0
     evolution_agent_cost_usd: float = 0.0
+    self_test_cost_usd: float = 0.0
     judge_cost_usd: float = 0.0
     judge_prompt_tokens: int = 0
     judge_completion_tokens: int = 0
@@ -168,6 +176,7 @@ class JudgeMatchResult:
     executable_specificity: float = 0.0
     high_risk_blacklist: float = 0.0
     generalization_transfer: float = 0.0
+    self_test_pass_rate: float = 0.0
     probability_of_success: float = 0.0
     parent_success_prob: float = 0.0
     candidate_success_prob: float = 0.0
@@ -186,6 +195,58 @@ class JudgeResult:
     expected_win_rate: float
     matches: list[JudgeMatchResult]
     uncertainty: float = 0.0
+
+
+@dataclass
+class ExecutableSkillTestCaseResult:
+    """Measured result for one generator-produced synthetic skill test."""
+
+    skill_name: str
+    test_name: str
+    should_activate: bool
+    activated: bool
+    passed: bool
+    reason: str
+    agent_answer: str = ""
+    missing_checks: list[str] = field(default_factory=list)
+    missing_rejections: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ExecutableSkillTestSuiteResult:
+    """Measured executable test-suite result passed to the judge."""
+
+    passed: int
+    total: int
+    pass_rate: float
+    cases: list[ExecutableSkillTestCaseResult] = field(default_factory=list)
+
+    def to_report(self, max_cases: int = 8) -> str:
+        if self.total <= 0:
+            return "No executable skill tests were run."
+        lines = [
+            "EXECUTABLE_SKILL_TEST_RESULTS",
+            f"actual_pass_rate: {self.pass_rate:.3f} ({self.passed}/{self.total})",
+        ]
+        for case in self.cases[:max_cases]:
+            status = "PASS" if case.passed else "FAIL"
+            lines.append(
+                (
+                    f"- {status} {case.skill_name}/{case.test_name}: "
+                    f"should_activate={case.should_activate} activated={case.activated}; "
+                    f"reason={case.reason}"
+                )
+            )
+            if case.missing_checks:
+                lines.append(f"  missing_checks: {', '.join(case.missing_checks)}")
+            if case.missing_rejections:
+                lines.append(f"  missing_rejections: {', '.join(case.missing_rejections)}")
+            if case.agent_answer:
+                answer = case.agent_answer.replace("\n", " ")[:300]
+                lines.append(f"  agent_answer: {answer}")
+        if len(self.cases) > max_cases:
+            lines.append(f"- ... {len(self.cases) - max_cases} more executable test cases omitted")
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -302,6 +363,16 @@ class SelfImprovingLoop:
             self._per_cat_offset = {cat: 0 for cat in train_pools.keys()}
             self._per_failure_type_offset = {}
 
+        # Phase 3: curriculum bandit over failure categories. Initialized from
+        # whichever category set is known at construction time; updated with
+        # proposal outcomes during the loop. Only consulted when
+        # config.failure_selection == "bandit".
+        self._bandit = CategoryBandit(
+            list(self._per_cat_offset.keys()),
+            epsilon=config.failure_bandit_epsilon,
+            ema=config.failure_bandit_ema,
+        )
+
         # Paths
         self._project_root = Path(getattr(self.manager, "cwd", Path.cwd())).resolve()
         self._feedback_path = self._project_root / ".evoskill" / "feedback_history.md"
@@ -333,10 +404,12 @@ class SelfImprovingLoop:
         self._trajectory_cost_usd: float = 0.0
         self._preloaded_trajectory_cost_usd: float = 0.0
         self._evolution_agent_cost_usd: float = 0.0
+        self._self_test_cost_usd: float = 0.0
         self._judge_cost_usd: float = 0.0
         self._judge_prompt_tokens: int = 0
         self._judge_completion_tokens: int = 0
         self._judge_total_tokens: int = 0
+        self._executable_skill_test_cache: dict[str, ExecutableSkillTestSuiteResult] = {}
 
     def _emit(self, event: str, **data: Any) -> None:
         """Fire an event to the display callback if one is registered."""
@@ -353,6 +426,8 @@ class SelfImprovingLoop:
             self._trajectory_cost_usd = getattr(self, "_trajectory_cost_usd", 0.0) + amount
         elif bucket == "evolution":
             self._evolution_agent_cost_usd = getattr(self, "_evolution_agent_cost_usd", 0.0) + amount
+        elif bucket == "self_test":
+            self._self_test_cost_usd = getattr(self, "_self_test_cost_usd", 0.0) + amount
         elif bucket == "judge":
             self._judge_cost_usd = getattr(self, "_judge_cost_usd", 0.0) + amount
 
@@ -381,6 +456,7 @@ class SelfImprovingLoop:
             trajectory_cost_usd=self._trajectory_cost_usd,
             preloaded_trajectory_cost_usd=self._preloaded_trajectory_cost_usd,
             evolution_agent_cost_usd=self._evolution_agent_cost_usd,
+            self_test_cost_usd=self._self_test_cost_usd,
             judge_cost_usd=self._judge_cost_usd,
             judge_prompt_tokens=self._judge_prompt_tokens,
             judge_completion_tokens=self._judge_completion_tokens,
@@ -393,6 +469,7 @@ class SelfImprovingLoop:
             f"(trajectory=${self._trajectory_cost_usd:.4f}, "
             f"preloaded=${self._preloaded_trajectory_cost_usd:.4f}, "
             f"evolution=${self._evolution_agent_cost_usd:.4f}, "
+            f"self_test=${self._self_test_cost_usd:.4f}, "
             f"judge=${self._judge_cost_usd:.4f}; "
             f"judge_tokens={self._judge_total_tokens} "
             f"in={self._judge_prompt_tokens} out={self._judge_completion_tokens})"
@@ -499,14 +576,21 @@ class SelfImprovingLoop:
             _log(f"ITER {iteration_count}/{self.config.max_iterations}", f"Parent: {parent}")
             self._emit("iter_start", iteration=actual_iteration, total=self.config.max_iterations, parent=parent)
 
-            # Round-robin sampling: pick samples_per_category from each of N categories (cycling)
+            # Pick which categories to sample failures from this iteration.
+            # Default: round-robin sweep. Bandit mode: weight by learning gain.
             n_cats_this_iter = min(self.config.categories_per_batch, n_cats)
+
+            if self.config.failure_selection == "bandit":
+                iter_cats = self._bandit.select(categories, n_cats_this_iter)
+            else:
+                iter_cats = [
+                    categories[(self._category_offset + j) % n_cats]
+                    for j in range(n_cats_this_iter)
+                ]
 
             test_samples: list[tuple[str, str, str]] = []
             sampled_cats: list[str] = []
-            for j in range(n_cats_this_iter):
-                cat_idx = (self._category_offset + j) % n_cats
-                cat = categories[cat_idx]
+            for cat in iter_cats:
                 pool = self.train_pools[cat]
 
                 # Take min(samples_per_category, pool_size) to handle small categories
@@ -582,10 +666,20 @@ class SelfImprovingLoop:
                 _log("", f"  -> Evaluating {child_name}...")
                 child_score = await self._score_child(in_sample_samples)  # accumulates to self._iter_cost
 
-                # Update frontier or discard
-                added = self.manager.update_frontier(
-                    child_name, child_score, max_size=self.config.frontier_size
-                )
+                # Update frontier or discard. QD mode also stores a per-category
+                # coverage vector and keeps one elite per niche.
+                if self.config.frontier_mode == "qd":
+                    gen_samples = self._generalization_samples(in_sample_samples)
+                    coverage = await self._evaluate_by_category(
+                        gen_samples or in_sample_samples
+                    )
+                    added = self.manager.update_frontier_qd(
+                        child_name, child_score, coverage
+                    )
+                else:
+                    added = self.manager.update_frontier(
+                        child_name, child_score, max_size=self.config.frontier_size
+                    )
 
                 if added:
                     _log("", f"  [OK] Added to frontier (score: {child_score:.4f})")
@@ -619,6 +713,36 @@ class SelfImprovingLoop:
                     parent_score=parent_score,
                     active_skills=active_skills,
                 )
+
+                # Phase 3: fold this outcome into the curriculum bandit so future
+                # iterations weight categories by realized learning gain.
+                accepted = added and child_score > parent_score
+                delta = child_score - parent_score
+                for cat in set(sampled_cats):
+                    self._bandit.update(cat, accepted, delta)
+
+                # Phase 1: an accepted (held-out-improving) child proves the
+                # bullets it added were helpful. Persist the bump on the child
+                # branch and COMMIT it — an uncommitted SKILL.md edit would be
+                # stashed away (and lost) by the next branch switch. A discarded
+                # child's branch, and its new bullets, are thrown away, so there
+                # is nothing to debit; harmful credit is left to the explicit
+                # `retire` op and future per-case attribution.
+                if (
+                    self.config.use_playbook
+                    and accepted
+                    and mutation_result.credited_bullets
+                ):
+                    update_bullet_counters(
+                        self._project_root,
+                        mutation_result.target_skill,
+                        mutation_result.credited_bullets,
+                        helpful=True,
+                    )
+                    self.manager.commit(
+                        f"{child_name}: playbook +helpful x"
+                        f"{len(mutation_result.credited_bullets)}"
+                    )
 
             # Check early stopping
             if no_improvement_count >= self.config.no_improvement_limit:
@@ -772,6 +896,34 @@ class SelfImprovingLoop:
             )
         return score / len(results)
 
+    async def _evaluate_by_category(
+        self, data: list[tuple[str, str, str]]
+    ) -> dict[str, float]:
+        """Per-category mean score over ``data`` (Phase 2 QD coverage vector).
+
+        Reuses the run cache, so when called right after ``_evaluate`` on the
+        same program tree it incurs no extra agent calls.
+        """
+        by_cat: dict[str, list[float]] = {}
+        if not data:
+            return {}
+        qa_data = [(q, a) for q, a, _ in data]
+        cats = [c for _, _, c in data]
+        results = await evaluate_agent_parallel(
+            self.agents.base, qa_data, max_concurrent=self.config.concurrency, cache=self.cache
+        )
+        for result, cat in zip(results, cats):
+            if result.trace is None or result.trace.output is None:
+                s = 0.0
+            else:
+                s = self.scorer(
+                    result.question,
+                    result.trace.output.final_answer,
+                    result.ground_truth,
+                )
+            by_cat.setdefault(cat, []).append(s)
+        return {c: (sum(v) / len(v)) for c, v in by_cat.items() if v}
+
     async def _mutate(
         self,
         parent: str,
@@ -816,6 +968,7 @@ class SelfImprovingLoop:
             diversity_hint=diversity_hint,
             questions=questions,
             domain_hints=self.config.error_surface_hints,
+            max_active_skills=self.config.max_active_skills,
         )
 
         if evolution_mode == "skill_only":
@@ -912,14 +1065,18 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 skill_query = build_skill_query_from_skill_proposer(proposer_trace)
 
             skills_before = set(self._get_active_skills())
-            # Capture pre-run content hash for edit-mode diagnostics
+            # Capture pre-run content hash + text for edit-mode diagnostics and
+            # the content-retention guard.
             _pre_skill_hash: str | None = None
+            _pre_skill_text: str | None = None
             _changed = False
             if action_type == "edit" and target_skill:
                 import hashlib
                 _sp = self._project_root / ".claude" / "skills" / target_skill / "SKILL.md"
                 if _sp.exists():
-                    _pre_skill_hash = hashlib.md5(_sp.read_bytes()).hexdigest()
+                    _pre_skill_bytes = _sp.read_bytes()
+                    _pre_skill_hash = hashlib.md5(_pre_skill_bytes).hexdigest()
+                    _pre_skill_text = _pre_skill_bytes.decode("utf-8", errors="replace")
             skill_trace = await self.agents.skill_generator.run(skill_query)
             self._add_iteration_cost(skill_trace.total_cost_usd, "evolution")
             if skill_trace.is_error or skill_trace.parse_error:
@@ -986,13 +1143,27 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 skill_valid = expected_skill_path.exists() and (
                     _pre_skill_hash is None or _changed
                 )
+                discard_reason = "did not produce a changed SKILL.md"
+                # Content-retention guard: reject an edit that silently dropped a
+                # large fraction of the file or removed a previously-present
+                # section, instead of preserving still-valid content.
+                if skill_valid and _pre_skill_text is not None and expected_skill_path.exists():
+                    new_text = expected_skill_path.read_text()
+                    old_len = len(_pre_skill_text.strip())
+                    new_len = len(new_text.strip())
+                    ratio = max(0.0, min(1.0, self.config.skill_edit_min_retention_ratio))
+                    length_ok = old_len == 0 or new_len >= ratio * old_len
+                    dropped_sections = self._section_headers(_pre_skill_text) - self._section_headers(new_text)
+                    if not length_ok or dropped_sections:
+                        skill_valid = False
+                        discard_reason = (
+                            f"regressed content (len {old_len}->{new_len}, "
+                            f"dropped sections: {sorted(dropped_sections)})"
+                        )
                 if not skill_valid:
                     _log(
                         "",
-                        (
-                            "  [WARN] Skill edit did not produce a changed SKILL.md; "
-                            f"discarding {child_name}"
-                        ),
+                        f"  [WARN] Skill edit {discard_reason}; discarding {child_name}",
                     )
                     self.manager.discard(child_name)
                     self.manager.switch_to(parent)
@@ -1049,6 +1220,33 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     self._prompt_path, prompt_trace.output.optimized_prompt
                 )
 
+        # Phase 1: apply the proposer's playbook delta to the resolved skill,
+        # layering managed bullets (with helpful/harmful counters) onto the
+        # generated SKILL.md before commit, so the change is versioned together.
+        credited_bullets: list[str] = []
+        playbook_target = ""
+        if evolution_mode == "skill_only" and self.config.use_playbook:
+            ops = [op.model_dump() for op in getattr(proposer_output, "bullet_ops", [])]
+            if ops:
+                playbook_target = (
+                    target_skill
+                    if action_type == "edit" and target_skill
+                    else (created_skill or "")
+                )
+                if playbook_target:
+                    credited_bullets = apply_playbook_delta(
+                        self._project_root,
+                        playbook_target,
+                        ops,
+                        dedup_threshold=self.config.playbook_dedup_threshold,
+                        max_bullets=self.config.playbook_max_bullets,
+                    )
+                    _log(
+                        "",
+                        f"  -> Playbook delta on {playbook_target}: "
+                        f"{len(ops)} op(s), {len(credited_bullets)} bullet(s) credited",
+                    )
+
         # Commit changes
         self.manager.commit(f"{child_name}: {proposed[:50]}")
 
@@ -1072,6 +1270,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
             coverage_plan=coverage_plan,
             regression_risks=regression_risks,
             skill_name=resolved_skill_name or "",
+            target_skill=playbook_target,
+            credited_bullets=credited_bullets,
         )
 
     async def _mutate_with_fallback(
@@ -1249,6 +1449,25 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     "as the final answer; refine loop will attempt a revision"
                 ),
             )
+        tests_payload = getattr(output, "skill_tests", None)
+        if tests_payload is not None:
+            import json
+
+            tests_path = skill_path.parent / "SKILL_TESTS.json"
+            if isinstance(tests_payload, list):
+                serializable_tests = [
+                    item.model_dump() if hasattr(item, "model_dump") else item
+                    for item in tests_payload
+                ]
+                tests_path.write_text(
+                    json.dumps(serializable_tests, ensure_ascii=False, indent=2) + "\n"
+                )
+                _log(
+                    "",
+                    f"  -> Materialized SKILL_TESTS.json: {skill_name} ({len(tests_payload)} tests)",
+                )
+            else:
+                _log("", f"  [WARN] Ignoring invalid skill_tests payload for {skill_name}")
         return skill_name
 
     @staticmethod
@@ -1379,6 +1598,313 @@ and modify it to add these capabilities. Preserve all existing content that is s
             if skill_dir.is_dir() and skill_file.exists():
                 parts.append(f"### Skill: {skill_dir.name}\n{skill_file.read_text()}")
         return "\n\n".join(parts) if parts else "No skills available."
+
+    def _get_all_skill_tests_content(self) -> str:
+        """Read generated synthetic skill tests for judge-time validation."""
+        skills_dir = self._project_root / ".claude" / "skills"
+        if not skills_dir.exists():
+            return "No skill tests available."
+        parts = []
+        for skill_dir in sorted(skills_dir.iterdir()):
+            tests_file = skill_dir / "SKILL_TESTS.json"
+            if skill_dir.is_dir() and tests_file.exists():
+                text = tests_file.read_text().strip()
+                if text:
+                    parts.append(f"### Tests for skill: {skill_dir.name}\n{text}")
+        return "\n\n".join(parts) if parts else "No skill tests available."
+
+    def _load_skill_test_specs(self) -> list[tuple[str, dict[str, Any]]]:
+        """Load generated synthetic skill tests from active project skills."""
+        skills_dir = self._project_root / ".claude" / "skills"
+        if not skills_dir.exists():
+            return []
+        specs: list[tuple[str, dict[str, Any]]] = []
+        for skill_dir in sorted(skills_dir.iterdir()):
+            tests_file = skill_dir / "SKILL_TESTS.json"
+            if not skill_dir.is_dir() or not tests_file.exists():
+                continue
+            try:
+                payload = json.loads(tests_file.read_text())
+            except json.JSONDecodeError as exc:
+                _log("WARN", f"  [SELF-TEST] Invalid {tests_file}: {exc}")
+                continue
+            if not isinstance(payload, list):
+                _log("WARN", f"  [SELF-TEST] Ignoring non-list test payload: {tests_file}")
+                continue
+            for item in payload:
+                if isinstance(item, dict):
+                    specs.append((skill_dir.name, item))
+        max_cases = max(0, int(self.config.executable_skill_test_max_cases))
+        return specs[:max_cases] if max_cases else []
+
+    @staticmethod
+    def _evidence_words(text: str) -> set[str]:
+        import re
+
+        stop = {
+            "a", "an", "and", "are", "as", "be", "by", "for", "from", "in",
+            "is", "it", "of", "on", "or", "the", "to", "with", "without",
+            "must", "should", "would", "that", "this",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-zA-Z0-9_.%-]+", str(text).lower())
+            if len(token) > 2 and token not in stop
+        }
+
+    @classmethod
+    def _contains_evidence(cls, text: str, phrase: str) -> bool:
+        """Loose evidence match for synthetic test rubrics."""
+        haystack = str(text or "").lower()
+        needle = str(phrase or "").strip().lower()
+        if not needle:
+            return True
+        if needle in haystack:
+            return True
+        words = cls._evidence_words(needle)
+        if not words:
+            return True
+        present = cls._evidence_words(haystack)
+        required = 1.0 if len(words) <= 2 else 0.6
+        return len(words & present) / max(1, len(words)) >= required
+
+    @staticmethod
+    def _skill_test_query(skill_name: str, spec: dict[str, Any]) -> str:
+        """Turn one synthetic SkillTest spec into a small executable task."""
+        must_check = spec.get("must_check") if isinstance(spec.get("must_check"), list) else []
+        must_reject = spec.get("must_reject") if isinstance(spec.get("must_reject"), list) else []
+        source_data = str(spec.get("source_data") or "").strip()
+        task = str(spec.get("task") or "").strip()
+        if source_data or task:
+            parts = [
+                "Executable synthetic regression task. Solve it using only the data below; "
+                "do not browse the web and do not inspect unrelated project data.",
+                f"Candidate skill under test: {skill_name}",
+                f"Test name: {spec.get('name', 'unnamed')}",
+                f"Scenario: {spec.get('scenario', '')}",
+            ]
+            if source_data:
+                parts.append(f"Source data:\n{source_data}")
+            if task:
+                parts.append(f"Task:\n{task}")
+            if must_check:
+                parts.append(f"Important checks to preserve: {json.dumps(must_check, ensure_ascii=False)}")
+            if must_reject:
+                parts.append(
+                    f"Tempting wrong methods to avoid: {json.dumps(must_reject, ensure_ascii=False)}"
+                )
+            parts.append(
+                "Return the final answer and only the brief work needed to justify it. "
+                "Use any loaded skill only if its trigger conditions actually apply."
+            )
+            return "\n\n".join(parts)
+        return (
+            "Synthetic skill regression test. Use only the scenario below; do not browse "
+            "the web and do not inspect unrelated project data.\n\n"
+            f"Candidate skill under test: {skill_name}\n"
+            f"Test name: {spec.get('name', 'unnamed')}\n"
+            f"Scenario: {spec.get('scenario', '')}\n"
+            f"Expected activation: {bool(spec.get('should_activate', False))}\n"
+            f"Expected behavior: {spec.get('expected_behavior', '')}\n"
+            f"Required checks: {json.dumps(must_check, ensure_ascii=False)}\n"
+            f"Rejected operations/alternatives: {json.dumps(must_reject, ensure_ascii=False)}\n"
+            f"Regression guard: {spec.get('regression_guard', '')}\n\n"
+            "Respond with a concise verification note. If the skill should activate, "
+            "apply it and explicitly name the checks performed and the rejected "
+            "alternatives avoided. If it should not activate, keep the answer simple "
+            "and explicitly state that the skill-specific contract is not needed."
+        )
+
+    def _score_executable_skill_test(
+        self,
+        *,
+        skill_name: str,
+        spec: dict[str, Any],
+        trace: AgentTrace,
+    ) -> ExecutableSkillTestCaseResult:
+        from src.schemas.trajectory import StoredTrajectory
+
+        test_name = str(spec.get("name") or "unnamed")
+        should_activate = bool(spec.get("should_activate", False))
+        answer = trace.output.final_answer if trace.output and trace.output.final_answer else str(trace.result or "")
+        stored = StoredTrajectory.from_trace(
+            trace=trace,
+            question=self._skill_test_query(skill_name, spec),
+            ground_truth=str(spec.get("expected_behavior", "")),
+            category="synthetic_skill_test",
+            agent_answer=answer,
+        )
+        transcript = "\n".join([answer, str(trace.result or ""), *stored.trace_messages])
+        transcript_lower = transcript.lower()
+        # Path-only evidence is too noisy: the harness or agent can inspect
+        # SKILL.md without actually applying the skill. Treat explicit reported
+        # skill usage or a named contract/protocol marker as activation.
+        activation_markers = (
+            f"{skill_name} contract",
+            f"{skill_name} protocol",
+            f"used {skill_name}",
+            f"using {skill_name}",
+            f"activate {skill_name}",
+            f"activated {skill_name}",
+            f"`{skill_name}`",
+        )
+        activated = (
+            skill_name in set(stored.skills_used)
+            or any(marker in transcript_lower for marker in activation_markers)
+        )
+        must_check = spec.get("must_check") if isinstance(spec.get("must_check"), list) else []
+        must_reject = spec.get("must_reject") if isinstance(spec.get("must_reject"), list) else []
+        expected_intermediate = (
+            spec.get("expected_intermediate")
+            if isinstance(spec.get("expected_intermediate"), list)
+            else []
+        )
+        forbidden_outputs = (
+            spec.get("forbidden_outputs")
+            if isinstance(spec.get("forbidden_outputs"), list)
+            else []
+        )
+        expected_answer = str(spec.get("expected_answer") or "").strip()
+        concrete_task = bool(str(spec.get("task") or "").strip() or str(spec.get("source_data") or "").strip())
+        missing_checks = [
+            str(item) for item in [*must_check, *expected_intermediate]
+            if not self._contains_evidence(transcript, str(item))
+        ]
+        diagnostic_missing_checks: list[str] = []
+        if concrete_task:
+            # Concrete tests are behavior tests: final answer, activation
+            # boundary, and explicit forbidden final answers are hard signals.
+            # Rubric text is useful feedback for refinement, but should not
+            # fail a solved mini-task merely because the agent used different
+            # wording or omitted a verbose ledger.
+            diagnostic_missing_checks = list(missing_checks)
+            missing_checks = []
+
+        final_answer_text = str(answer or "").strip().lower()
+        forbidden_hits = [
+            str(item) for item in forbidden_outputs
+            if str(item).strip() and str(item).strip().lower() == final_answer_text
+        ]
+        missing_rejections: list[str] = []
+        if not concrete_task:
+            # Backward-compatible abstract tests still expect explicit mention
+            # of avoided alternatives because there is no concrete answer to
+            # distinguish the wrong method from the right one.
+            missing_rejections = [
+                str(item) for item in must_reject
+                if not self._contains_evidence(transcript, str(item))
+            ]
+
+        answer_ok = True
+        if expected_answer:
+            answer_ok = score_answer(expected_answer, answer, 0.01) > 0.0
+            if not answer_ok:
+                missing_checks.append(f"expected_answer={expected_answer}")
+
+        activation_ok = activated == should_activate
+        behavior_ok = answer_ok and not missing_checks and not missing_rejections and not forbidden_hits
+        passed = (not trace.is_error) and activation_ok and behavior_ok
+        reasons: list[str] = []
+        if trace.is_error:
+            reasons.append(f"agent error: {trace.parse_error or 'unknown'}")
+        if not activation_ok:
+            reasons.append(
+                f"activation mismatch: expected {should_activate}, observed {activated}"
+            )
+        if missing_checks:
+            reasons.append("missing required checks")
+        if missing_rejections:
+            reasons.append("missing rejected alternatives")
+        if forbidden_hits:
+            reasons.append("forbidden output/method appeared")
+            missing_rejections.extend(forbidden_hits)
+        if expected_answer and not answer_ok:
+            reasons.append("expected answer not produced")
+        if not reasons:
+            reasons.append("activation and rubric evidence matched")
+        return ExecutableSkillTestCaseResult(
+            skill_name=skill_name,
+            test_name=test_name,
+            should_activate=should_activate,
+            activated=activated,
+            passed=passed,
+            reason="; ".join(reasons),
+            agent_answer=answer,
+            missing_checks=missing_checks or diagnostic_missing_checks,
+            missing_rejections=missing_rejections,
+        )
+
+    async def _run_executable_skill_tests(self) -> ExecutableSkillTestSuiteResult:
+        """Run generated SKILL_TESTS.json as real synthetic agent tasks."""
+        if not self.config.executable_skill_tests:
+            return ExecutableSkillTestSuiteResult(0, 0, 0.0)
+        specs = self._load_skill_test_specs()
+        if not specs:
+            return ExecutableSkillTestSuiteResult(0, 0, 0.0)
+
+        cache_key = json.dumps(
+            {
+                "skills": self._get_all_skills_content(),
+                "tests": specs,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        cached = getattr(self, "_executable_skill_test_cache", {}).get(cache_key)
+        if cached is not None:
+            return cached
+
+        _log("SELF-TEST", f"Running {len(specs)} executable skill test(s)...")
+        semaphore = asyncio.Semaphore(max(1, self.config.executable_skill_test_concurrency))
+
+        async def run_one(skill_name: str, spec: dict[str, Any]) -> ExecutableSkillTestCaseResult:
+            async with semaphore:
+                query = self._skill_test_query(skill_name, spec)
+                try:
+                    async with asyncio.timeout(self.config.executable_skill_test_timeout_seconds):
+                        trace = await self.agents.base.run(query)
+                    self._add_iteration_cost(trace.total_cost_usd, "self_test")
+                except Exception as exc:  # noqa: BLE001 - harness transports vary
+                    trace = AgentTrace(
+                        duration_ms=0,
+                        total_cost_usd=0.0,
+                        num_turns=0,
+                        usage={},
+                        result="",
+                        is_error=True,
+                        parse_error=f"{type(exc).__name__}: {exc}",
+                        messages=[],
+                    )
+                return self._score_executable_skill_test(
+                    skill_name=skill_name,
+                    spec=spec,
+                    trace=trace,
+                )
+
+        cases = await asyncio.gather(*(run_one(skill, spec) for skill, spec in specs))
+        passed = sum(1 for case in cases if case.passed)
+        result = ExecutableSkillTestSuiteResult(
+            passed=passed,
+            total=len(cases),
+            pass_rate=passed / len(cases) if cases else 0.0,
+            cases=list(cases),
+        )
+        self._executable_skill_test_cache[cache_key] = result
+        _log(
+            "SELF-TEST",
+            f"Executable skill tests: {result.passed}/{result.total} pass_rate={result.pass_rate:.3f}",
+        )
+        for case in result.cases:
+            status = "PASS" if case.passed else "FAIL"
+            _log(
+                "",
+                (
+                    f"  [{status}] {case.skill_name}/{case.test_name}: "
+                    f"expected_activate={case.should_activate} activated={case.activated}; "
+                    f"{case.reason}"
+                ),
+            )
+        return result
 
     def _get_program_skills_content(self, program_name: str, restore_to: str | None = None) -> str:
         """Read active skills for a stored program and optionally restore another program."""
@@ -1799,6 +2325,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     "executable_specificity": {"type": "number"},
                     "high_risk_blacklist": {"type": "number"},
                     "generalization_transfer": {"type": "number"},
+                    "self_test_pass_rate": {"type": "number"},
                     "set_a_success_prob": {"type": "number"},
                     "set_b_success_prob": {"type": "number"},
                     "b_over_a_score": {"type": "number"},
@@ -1817,6 +2344,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     "executable_specificity",
                     "high_risk_blacklist",
                     "generalization_transfer",
+                    "self_test_pass_rate",
                     "set_a_success_prob",
                     "set_b_success_prob",
                     "b_over_a_score",
@@ -1844,12 +2372,17 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
         from src.harness.provider_auth import ensure_provider_api_key
         api_key = ensure_provider_api_key(provider)
+        # Safe even when self.config is absent (some unit tests construct the loop
+        # via object.__new__): default to the historical 512-token budget.
+        max_out = int(
+            getattr(getattr(self, "config", None), "judge_max_output_tokens", 512) or 512
+        )
         if provider == "anthropic":
             import anthropic
             client = anthropic.AsyncAnthropic(api_key=api_key)
             resp = await client.messages.create(
                 model=model,
-                max_tokens=512,
+                max_tokens=max_out,
                 messages=[{"role": "user", "content": prompt}],
             )
             self._record_judge_api_usage(provider, model, getattr(resp, "usage", None))
@@ -1862,9 +2395,9 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 "messages": [{"role": "user", "content": prompt}],
             }
             if model.startswith(("gpt-5", "o1", "o3", "o4")):
-                kwargs["max_completion_tokens"] = 512
+                kwargs["max_completion_tokens"] = max_out
             else:
-                kwargs["max_tokens"] = 512
+                kwargs["max_tokens"] = max_out
             resp = await client.chat.completions.create(**kwargs)
             self._record_judge_api_usage(provider, model, getattr(resp, "usage", None))
             return resp.choices[0].message.content or ""
@@ -1884,10 +2417,6 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 except (TypeError, ValueError):
                     return 0
         return 0
-
-    @staticmethod
-    def _normalize_model_name(model: str) -> str:
-        return model.split("/", 1)[-1].strip().lower()
 
     @staticmethod
     def _default_judge_price_per_1m(provider: str, model: str) -> tuple[float | None, float | None]:
@@ -2133,14 +2662,16 @@ and modify it to add these capabilities. Preserve all existing content that is s
         executable = SelfImprovingLoop._clamp01(data.get("executable_specificity"), default=0.0)
         blacklist = SelfImprovingLoop._clamp01(data.get("high_risk_blacklist"), default=0.0)
         transfer = SelfImprovingLoop._clamp01(data.get("generalization_transfer"), default=0.0)
+        self_tests = SelfImprovingLoop._clamp01(data.get("self_test_pass_rate"), default=0.0)
         return max(
             0.0,
             min(
                 1.0,
-                0.35 * mechanism
-                + 0.30 * executable
-                + 0.20 * blacklist
-                + 0.15 * transfer,
+                0.30 * mechanism
+                + 0.25 * executable
+                + 0.18 * blacklist
+                + 0.15 * transfer
+                + 0.12 * self_tests,
             ),
         )
 
@@ -2558,6 +3089,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
         candidate_skill_summary: str = "",
         skill_diff: str = "",
         skill_diff_swapped: str = "",
+        candidate_skill_tests: str = "",
+        executable_skill_test_result: ExecutableSkillTestSuiteResult | None = None,
         proposer_root_cause: str = "",
     ) -> JudgeResult:
         """Estimate failure-recovery quality with LLM-judged pairwise matches.
@@ -2581,7 +3114,18 @@ and modify it to add these capabilities. Preserve all existing content that is s
         parent_skill_summary = self._compact_judge_text(parent_skill_summary, max_chars=2500)
         candidate_skill_summary = self._compact_judge_text(candidate_skill_summary, max_chars=2500)
         skill_diff = self._compact_judge_text(skill_diff, max_chars=3200)
+        if executable_skill_test_result is not None:
+            candidate_skill_tests = (
+                f"{candidate_skill_tests}\n\n"
+                f"{executable_skill_test_result.to_report()}"
+            )
+        candidate_skill_tests = self._compact_judge_text(candidate_skill_tests, max_chars=2500)
         proposer_root_cause = self._compact_judge_text(proposer_root_cause, max_chars=1200)
+        executable_self_test_rate = (
+            executable_skill_test_result.pass_rate
+            if executable_skill_test_result is not None and executable_skill_test_result.total > 0
+            else None
+        )
         semaphore = asyncio.Semaphore(self.config.judge_concurrency)
         child_rating = self.config.judge_elo_initial_rating
         opponent_rating = self.config.judge_elo_initial_rating
@@ -2611,6 +3155,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 parent_skill_summary=a_summary,
                 candidate_skill_summary=b_summary,
                 skill_diff=diff,
+                candidate_skill_tests=candidate_skill_tests,
                 case_type=case_type,
                 case_feedback=case_feedback,
                 proposer_root_cause=proposer_root_cause,
@@ -2710,6 +3255,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                             "executable_specificity",
                             "high_risk_blacklist",
                             "generalization_transfer",
+                            "self_test_pass_rate",
                         ):
                             data[fld] = 0.5 * (
                                 self._clamp01(d_b.get(fld), default=0.0)
@@ -2727,6 +3273,12 @@ and modify it to add these capabilities. Preserve all existing content that is s
                     if data is None:
                         return _failed_case(index, category, case_type, "Judge call failed")
 
+                if executable_self_test_rate is not None:
+                    # The synthetic tests were actually executed against the
+                    # candidate program, so this measured result supersedes the
+                    # judge's static estimate.
+                    data["self_test_pass_rate"] = executable_self_test_rate
+                    data["_executable_self_test_pass_rate"] = executable_self_test_rate
                 data["_index"] = index
                 data["_category"] = (
                     f"{category}:regression" if case_type == "regression" else category
@@ -2812,10 +3364,22 @@ and modify it to add these capabilities. Preserve all existing content that is s
             executable_specificity = self._clamp01(data.get("executable_specificity"), default=0.0)
             high_risk_blacklist = self._clamp01(data.get("high_risk_blacklist"), default=0.0)
             generalization_transfer = self._clamp01(data.get("generalization_transfer"), default=0.5)
+            self_test_pass_rate = self._clamp01(data.get("self_test_pass_rate"), default=0.0)
             artifact_quality = self._judge_artifact_quality(data)
             gated_match_score = self._apply_artifact_quality_gate(match_score, artifact_quality)
             if gated_match_score != match_score:
                 match_score = gated_match_score
+                relative_advantage = max(-1.0, min(1.0, 2.0 * (match_score - 0.5)))
+
+            # Asymmetric regression penalty: breaking a previously-correct case is
+            # worse than fixing a new failure is good. When the candidate scores
+            # below 0.5 on a regression case, amplify the below-0.5 deviation so a
+            # regression cannot be silently averaged away by an unrelated fix.
+            is_regression_case = str(data.get("_category", "")).endswith(":regression")
+            reg_weight = max(1.0, float(self.config.judge_regression_penalty_weight))
+            if is_regression_case and reg_weight > 1.0 and match_score < 0.5:
+                penalized = 0.5 - (0.5 - match_score) * reg_weight
+                match_score = max(0.0, penalized)
                 relative_advantage = max(-1.0, min(1.0, 2.0 * (match_score - 0.5)))
 
             expected_before = self._elo_expected(_initial_child_rating, _initial_opponent_rating, scale)
@@ -2853,6 +3417,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 executable_specificity=executable_specificity,
                 high_risk_blacklist=high_risk_blacklist,
                 generalization_transfer=generalization_transfer,
+                self_test_pass_rate=self_test_pass_rate,
                 probability_of_success=self._clamp01(
                     data.get("probability_of_success"),
                     default=candidate_success_prob,
@@ -2886,7 +3451,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         f"mechanism={result.failure_mechanism_encoding:.3f} "
                         f"exec={result.executable_specificity:.3f} "
                         f"blacklist={result.high_risk_blacklist:.3f} "
-                        f"transfer={result.generalization_transfer:.3f}"
+                        f"transfer={result.generalization_transfer:.3f} "
+                        f"self_tests={result.self_test_pass_rate:.3f}"
                     ),
                 )
                 if result.root_cause:
@@ -2989,6 +3555,40 @@ and modify it to add these capabilities. Preserve all existing content that is s
         return weakest.reasoning or ""
 
     @staticmethod
+    def _self_test_revision_feedback(
+        result: "ExecutableSkillTestSuiteResult | None",
+        max_cases: int = 6,
+        max_answer_chars: int = 240,
+    ) -> str:
+        """Compact executable self-test failures for the skill revision prompt."""
+        if result is None or result.total <= 0:
+            return ""
+
+        ordered = sorted(result.cases, key=lambda c: (c.passed, c.test_name))
+        lines = [
+            f"actual_pass_rate: {result.pass_rate:.3f} ({result.passed}/{result.total})",
+        ]
+        for case in ordered[:max_cases]:
+            status = "PASS" if case.passed else "FAIL"
+            lines.append(
+                (
+                    f"- {status} {case.skill_name}/{case.test_name}: "
+                    f"should_activate={case.should_activate}, activated={case.activated}; "
+                    f"{case.reason}"
+                )
+            )
+            if case.missing_checks:
+                lines.append(f"  missing_checks: {', '.join(case.missing_checks[:5])}")
+            if case.missing_rejections:
+                lines.append(f"  missing_rejections: {', '.join(case.missing_rejections[:5])}")
+            if case.agent_answer and not case.passed:
+                answer = " ".join(case.agent_answer.split())[:max_answer_chars]
+                lines.append(f"  agent_answer: {answer}")
+        if len(ordered) > max_cases:
+            lines.append(f"- ... {len(ordered) - max_cases} more self-test cases omitted")
+        return "\n".join(lines)
+
+    @staticmethod
     def _mean_generalization_transfer(judge_result: "JudgeResult") -> float:
         """Mean judge-estimated transferability over valid cases."""
         transfers = [
@@ -2997,6 +3597,46 @@ and modify it to add these capabilities. Preserve all existing content that is s
             if getattr(m, "valid", True)
         ]
         return sum(transfers) / len(transfers) if transfers else 0.0
+
+    @staticmethod
+    def _mean_self_test_pass_rate(judge_result: "JudgeResult") -> float:
+        """Mean judge-estimated pass rate for candidate-generated skill tests."""
+        rates = [
+            max(0.0, min(1.0, getattr(m, "self_test_pass_rate", 0.0)))
+            for m in judge_result.matches
+            if getattr(m, "valid", True)
+        ]
+        return sum(rates) / len(rates) if rates else 0.0
+
+    @staticmethod
+    def _section_headers(markdown: str) -> set[str]:
+        """Lowercased set of markdown section header titles in a SKILL.md."""
+        import re
+
+        return {
+            match.group(1).strip().lower()
+            for match in re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", markdown or "")
+        }
+
+    def _missing_required_sections(self, markdown: str) -> list[str]:
+        """Required SKILL.md sections (from config) absent in ``markdown``.
+
+        Completeness guard: a created or edited skill that omits any required
+        section is treated as an incomplete modification and routed through one
+        judge-feedback refine round to fill the gap.
+        """
+        required = tuple(getattr(self.config, "required_skill_sections", ()) or ())
+        if not required:
+            return []
+        headers = self._section_headers(markdown)
+        return [section for section in required if section.strip().lower() not in headers]
+
+    def _active_skill_markdown(self, skill_name: str) -> str:
+        """Read one active skill's SKILL.md, or '' when it does not exist."""
+        if not skill_name:
+            return ""
+        path = self._project_root / ".claude" / "skills" / skill_name / "SKILL.md"
+        return path.read_text() if path.exists() else ""
 
     @staticmethod
     def _has_misleading_worked_example(markdown: str) -> bool:
@@ -3018,9 +3658,18 @@ and modify it to add these capabilities. Preserve all existing content that is s
 
         scaffold_values: set[str] = set()
         answer_values: set[str] = set()
+        # Self-check / scaffold lines whose number is an intermediate grid or
+        # bookkeeping count, not the predicate-satisfying final answer. Kept to a
+        # curated keyword set so ordinary computed lines are not flagged.
         scaffold_re = re.compile(
-            r"(?im)^\s*(?:ledger_count_check|expected[\w ]*count|expected\b.*\btests?)\b.*$"
+            r"(?im)^\s*(?:"
+            r"ledger_count_check|[\w ]*count_check|sanity[_ ]?check|grid[_ ]?size|"
+            r"total[_ ]cells|cell[_ ]count|row[_ ]count|expected[\w ]*count|"
+            r"expected\b.*\btests?"
+            r")\b.*$"
         )
+        # Any "<rows> x <cols> = <product>" style scaffold, with x/*/× and
+        # optional word labels between the factors.
         grid_re = re.compile(r"(?i)\b\d+\s*[x*×]\s*\d+\s*=\s*(\d[\d,]*)")
         answer_re = re.compile(r"(?im)^\s*(?:final_answer|answer)\s*[:=]\s*(.+)$")
 
@@ -3040,16 +3689,24 @@ and modify it to add these capabilities. Preserve all existing content that is s
         return bool(scaffold_values & answer_values)
 
     def _snapshot_skill_files(self) -> dict[str, bytes]:
-        """Capture current SKILL.md bytes so a failed revision can be rolled back."""
+        """Capture skill artifact bytes so a failed revision can be rolled back."""
         skills_dir = self._project_root / ".claude" / "skills"
         snapshot: dict[str, bytes] = {}
         if skills_dir.exists():
-            for path in skills_dir.rglob("SKILL.md"):
-                snapshot[str(path)] = path.read_bytes()
+            for pattern in ("SKILL.md", "SKILL_TESTS.json"):
+                for path in skills_dir.rglob(pattern):
+                    snapshot[str(path)] = path.read_bytes()
         return snapshot
 
     def _restore_skill_files(self, snapshot: dict[str, bytes]) -> None:
-        """Restore SKILL.md files captured by ``_snapshot_skill_files``."""
+        """Restore skill artifacts captured by ``_snapshot_skill_files``."""
+        skills_dir = self._project_root / ".claude" / "skills"
+        snapshot_paths = {Path(path_str) for path_str in snapshot}
+        if skills_dir.exists():
+            for pattern in ("SKILL.md", "SKILL_TESTS.json"):
+                for path in skills_dir.rglob(pattern):
+                    if path not in snapshot_paths:
+                        path.unlink()
         for path_str, data in snapshot.items():
             path = Path(path_str)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -3069,6 +3726,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
         parent_skills_content: str,
         proposer_root_cause: str,
         original_proposal: str,
+        self_test_gap: bool = False,
+        executable_skill_test_result: "ExecutableSkillTestSuiteResult | None" = None,
     ) -> tuple["JudgeResult", str, str, str, str, bool]:
         """Revise the child's skill once from the judge's verdict, then re-judge.
 
@@ -3078,12 +3737,13 @@ and modify it to add these capabilities. Preserve all existing content that is s
         does not improve the average match score vs the parent, so a refine can
         never lower a child's score.
         """
-        def _artifacts() -> tuple[str, str, str, str]:
+        def _artifacts() -> tuple[str, str, str, str, str]:
             content = self._get_all_skills_content()
             summary = self._summarize_skill_content(content)
             diff = self._diff_skill_content(parent_skills_content, content)
             diff_sw = self._diff_skill_content(content, parent_skills_content)
-            return content, summary, diff, diff_sw
+            tests = self._get_all_skill_tests_content()
+            return content, summary, diff, diff_sw, tests
 
         skill_path = (
             self._project_root / ".claude" / "skills" / skill_name / "SKILL.md"
@@ -3091,26 +3751,37 @@ and modify it to add these capabilities. Preserve all existing content that is s
             else None
         )
         if skill_path is None or not skill_path.exists():
-            content, summary, diff, diff_sw = _artifacts()
+            content, summary, diff, diff_sw, _tests = _artifacts()
             return judge_result, content, summary, diff, diff_sw, False
 
         judge_root_cause, judge_blockers = self._summarize_judge_feedback(judge_result)
         judge_reasoning = self._weakest_case_reasoning(judge_result)
         snapshot = self._snapshot_skill_files()
+        current_markdown = skill_path.read_text()
+        structural_gaps = (
+            self._missing_required_sections(current_markdown)
+            if self.config.enforce_skill_sections
+            else []
+        )
         revision_query = build_skill_revision_query(
             target_skill=skill_name,
-            current_skill_markdown=skill_path.read_text(),
+            current_skill_markdown=current_markdown,
             proposer_root_cause=proposer_root_cause,
             original_proposal=original_proposal,
             judge_root_cause=judge_root_cause,
             judge_blockers=judge_blockers,
             judge_reasoning=judge_reasoning,
+            structural_gaps=structural_gaps,
+            self_test_gap=self_test_gap,
+            executable_self_test_feedback=self._self_test_revision_feedback(
+                executable_skill_test_result
+            ),
         )
         try:
             revise_trace = await self.agents.skill_generator.run(revision_query)
         except Exception as e:  # noqa: BLE001 — generator transport may raise broadly
             _log("WARN", f"  [REFINE] Generator failed ({type(e).__name__}: {e}); keeping original")
-            content, summary, diff, diff_sw = _artifacts()
+            content, summary, diff, diff_sw, _tests = _artifacts()
             return judge_result, content, summary, diff, diff_sw, False
         self._add_iteration_cost(revise_trace.total_cost_usd, "evolution")
 
@@ -3125,10 +3796,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
         if not materialized:
             _log("", "  [REFINE] No revised SKILL.md produced; keeping original")
             self._restore_skill_files(snapshot)
-            content, summary, diff, diff_sw = _artifacts()
+            content, summary, diff, diff_sw, _tests = _artifacts()
             return judge_result, content, summary, diff, diff_sw, False
 
-        rev_content, rev_summary, rev_diff, rev_diff_sw = _artifacts()
+        rev_content, rev_summary, rev_diff, rev_diff_sw, rev_tests = _artifacts()
+        rev_executable_tests = await self._run_executable_skill_tests()
         try:
             rev_judge = await self._judge_skill_with_llm(
                 scoring_cases_ext,
@@ -3140,12 +3812,14 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 candidate_skill_summary=rev_summary,
                 skill_diff=rev_diff,
                 skill_diff_swapped=rev_diff_sw,
+                candidate_skill_tests=rev_tests,
+                executable_skill_test_result=rev_executable_tests,
                 proposer_root_cause=proposer_root_cause,
             )
         except RuntimeError as e:
             _log("WARN", f"  [REFINE] Re-judge failed ({e}); keeping original")
             self._restore_skill_files(snapshot)
-            content, summary, diff, diff_sw = _artifacts()
+            content, summary, diff, diff_sw, _tests = _artifacts()
             return judge_result, content, summary, diff, diff_sw, False
 
         if rev_judge.average_match_score > judge_result.average_match_score:
@@ -3175,7 +3849,7 @@ and modify it to add these capabilities. Preserve all existing content that is s
             ),
         )
         self._restore_skill_files(snapshot)
-        content, summary, diff, diff_sw = _artifacts()
+        content, summary, diff, diff_sw, _tests = _artifacts()
         return judge_result, content, summary, diff, diff_sw, False
 
     async def _run_with_llm_judge(self) -> LoopResult:
@@ -3486,6 +4160,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 proposer_confidence = mutation_result.proposer_confidence
                 sibling_proposals.append(proposal)
                 candidate_skills_content = self._get_all_skills_content()
+                candidate_skill_tests = self._get_all_skill_tests_content()
+                executable_skill_test_result = await self._run_executable_skill_tests()
                 parent_skill_summary = self._summarize_skill_content(parent_skills_content)
                 candidate_skill_summary = self._summarize_skill_content(candidate_skills_content)
                 skill_diff = self._diff_skill_content(parent_skills_content, candidate_skills_content)
@@ -3504,6 +4180,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         candidate_skill_summary=candidate_skill_summary,
                         skill_diff=skill_diff,
                         skill_diff_swapped=skill_diff_swapped,
+                        candidate_skill_tests=candidate_skill_tests,
+                        executable_skill_test_result=executable_skill_test_result,
                         proposer_root_cause=mutation_result.root_cause_analysis,
                     )
                 except RuntimeError as e:
@@ -3521,15 +4199,39 @@ and modify it to add these capabilities. Preserve all existing content that is s
                 ):
                     mean_root_fit = self._mean_root_cause_fit(judge_result)
                     mean_transfer = self._mean_generalization_transfer(judge_result)
+                    mean_self_tests = self._mean_self_test_pass_rate(judge_result)
                     misleading_example = (
                         self.config.validate_worked_examples
                         and self._has_misleading_worked_example(candidate_skills_content)
                     )
+                    # Completeness: the changed skill must carry every required
+                    # SKILL.md section; a missing section is an incomplete edit.
+                    missing_sections = (
+                        self._missing_required_sections(
+                            self._active_skill_markdown(mutation_result.skill_name)
+                        )
+                        if self.config.enforce_skill_sections and mutation_result.skill_name
+                        else []
+                    )
+                    # The executable self-test suite is the candidate's own re-run
+                    # signal; a suite with no negative (should_activate=false) case
+                    # never tested over-triggering, so its pass rate is gameable.
+                    weak_self_test_coverage = (
+                        executable_skill_test_result is not None
+                        and executable_skill_test_result.total > 0
+                        and not any(
+                            not case.should_activate
+                            for case in executable_skill_test_result.cases
+                        )
+                    )
                     needs_refine = (
                         mean_root_fit < self.config.refine_root_cause_threshold
                         or mean_transfer < self.config.refine_generalization_threshold
+                        or mean_self_tests < self.config.refine_self_test_threshold
                         or judge_result.average_match_score <= 0.5
                         or misleading_example
+                        or bool(missing_sections)
+                        or weak_self_test_coverage
                     )
                     if not needs_refine:
                         break
@@ -3539,11 +4241,24 @@ and modify it to add these capabilities. Preserve all existing content that is s
                             f"{child_name}: worked example emits a scaffold count as the answer "
                             "-> revising",
                         )
+                    if missing_sections:
+                        _log(
+                            "REFINE",
+                            f"{child_name}: skill missing required sections "
+                            f"{missing_sections} -> revising",
+                        )
+                    if weak_self_test_coverage:
+                        _log(
+                            "REFINE",
+                            f"{child_name}: self-test suite has no negative "
+                            "(should_activate=false) case -> revising",
+                        )
                     _log(
                         "REFINE",
                         (
                             f"{child_name}: root_fit={mean_root_fit:.3f} "
                             f"transfer={mean_transfer:.3f} "
+                            f"self_tests={mean_self_tests:.3f} "
                             f"avg_match={judge_result.average_match_score:.3f} "
                             f"-> revising (round {refine_round + 1}/{self.config.refine_max_rounds})"
                         ),
@@ -3567,7 +4282,11 @@ and modify it to add these capabilities. Preserve all existing content that is s
                         parent_skills_content=parent_skills_content,
                         proposer_root_cause=mutation_result.root_cause_analysis,
                         original_proposal=proposal,
+                        self_test_gap=weak_self_test_coverage,
+                        executable_skill_test_result=executable_skill_test_result,
                     )
+                    candidate_skill_tests = self._get_all_skill_tests_content()
+                    executable_skill_test_result = await self._run_executable_skill_tests()
                     refine_round += 1
                     if not revised_kept:
                         break
@@ -3597,6 +4316,8 @@ and modify it to add these capabilities. Preserve all existing content that is s
                                 candidate_skill_summary=candidate_skill_summary,
                                 skill_diff=a_diff,
                                 skill_diff_swapped=a_diff_sw,
+                                candidate_skill_tests=candidate_skill_tests,
+                                executable_skill_test_result=executable_skill_test_result,
                                 proposer_root_cause=mutation_result.root_cause_analysis,
                             )
                         except RuntimeError as e:
