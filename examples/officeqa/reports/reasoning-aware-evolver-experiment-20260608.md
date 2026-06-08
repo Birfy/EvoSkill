@@ -35,7 +35,7 @@ Agent Reasoning (chain-of-thought before final answer):
 ## Evolver 运行
 
 - 数据集：93 条训练轨迹（DeepSeek-V4-Flash，无 Skill 基线）
-- 训练集基线：83.87%（78/93）
+- 训练集基线（Evolver 内部 BT 评分）：83.87%（78/93）；直接 score_answer() 评分：89.2%（83/93）
 - 迭代数：12 轮
 - 最优节点：frontier-distilled（Judge 估计分 86.74%）
 
@@ -57,8 +57,8 @@ Agent Reasoning (chain-of-thought before final answer):
 | 数据集 | 新 Skill | 基线 | 差值 | Skill 触发率 |
 |---|---|---|---|---|
 | Holdout 100（未见任务） | **89.0%** | 86.0% | **+3.0%** | 53% |
-| Train 93（训练任务） | **90.3%** | 88.2% | **+2.2%** | 63% |
-| 合计 193 | **89.6%** | 87.0% | **+2.6%** | 58% |
+| Train 93（训练任务） | **90.3%** | 89.2% | **+1.1%** | 63% |
+| 合计 193 | **89.6%** | 87.6% | **+2.0%** | 58% |
 
 与上轮 iter-skill-11（Holdout 76%，退化 10%）相比，本轮 Holdout +3.0%，完全扭转。
 
@@ -115,7 +115,7 @@ Evolver 在 12 轮迭代中对训练集失败的根因分析：
 
 | 版本 | Holdout 正确率 | 训练集正确率 | Skill 触发率 | 备注 |
 |---|---|---|---|---|
-| 纯基线（无 Skill） | 86.0% | 88.2% | — | DeepSeek-V4-Flash |
+| 纯基线（无 Skill） | 86.0% | 89.2% | — | DeepSeek-V4-Flash |
 | iter-skill-11（旧） | 76.0% | — | ~3% | Description 命令式，system prompt 污染 |
 | frontier-distilled（本轮） | **89.0%** | **90.3%** | **58%** | Description 被动标签 + 两阶段 Evolver |
 
