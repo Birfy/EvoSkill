@@ -1,0 +1,110 @@
+[
+  {
+    "name": "positive-cross-file-revision-detected",
+    "scenario": "Agent extracts FY1947 Army expenditures from an older bulletin without checking the newer bulletin for revised figures.",
+    "task": "Two Treasury Bulletin files are provided: one published April 1948, one published December 1952. Both contain Table 3 with military expenditure data by fiscal year. The question asks for FY1947 Army net expenditures. The older file shows FY1947 Army = 7,425; the newer file shows FY1947 Army = 6,911 (restated). Both files' footnotes confirm Air Force is included within Army for FY1947.",
+    "source_data": "File A (April 1948): Table 3, FY1947 Army = 7,425. Footnote: 'Air Force expenditures included under Army for 1947.' File B (December 1952): Table 3, FY1947 Army = 6,911. Footnote: 'Air Force expenditures included under Army for fiscal year 1947.' Both files are listed as source files for the task.",
+    "should_activate": true,
+    "expected_behavior": "Skill activates before agent finalizes the value. Agent cross-checks File B, discovers the revision, confirms consistent reporting structure via footnotes, and selects 6,911 from the later publication as the authoritative figure.",
+    "expected_answer": "6911",
+    "expected_intermediate": [
+      "Identifies target data point as FY1947 Army expenditures",
+      "Checks File B for same entity×time_period×metric",
+      "Finds conflicting value 6,911 in File B",
+      "Compares footnotes: both include Air Force within Army for FY1947",
+      "Selects later publication (December 1952) value of 6,911"
+    ],
+    "must_check": [
+      "Both files' footnotes on Air Force/Army treatment for FY1947",
+      "Publication dates of both files",
+      "Whether both files report the same metric (net expenditures) in the same units"
+    ],
+    "must_reject": [
+      "Using 7,425 without checking File B",
+      "Selecting 7,425 because it appears first or is easier to find",
+      "Averaging the two values"
+    ],
+    "forbidden_outputs": [
+      "7425",
+      "6758"
+    ],
+    "regression_guard": ""
+  },
+  {
+    "name": "negative-single-source-file",
+    "scenario": "Only one source file is provided — no cross-check possible.",
+    "task": "A single Treasury Bulletin file (published December 1952) is provided. The question asks for FY1940 Army net expenditures. The file contains Table 3 with FY1940 Army = 1,500.",
+    "source_data": "One source file: December 1952 Treasury Bulletin, Table 3, FY1940 Army = 1,500.",
+    "should_activate": false,
+    "expected_behavior": "Skill does not activate. Agent extracts 1,500 and proceeds normally without any cross-file gate.",
+    "expected_answer": "1500",
+    "expected_intermediate": [],
+    "must_check": [],
+    "must_reject": [],
+    "forbidden_outputs": [],
+    "regression_guard": ""
+  },
+  {
+    "name": "negative-explicit-source-instruction",
+    "scenario": "Question explicitly specifies which file to use.",
+    "task": "Two Treasury Bulletin files are provided (April 1948 and December 1952). The question explicitly states: 'Using the April 1948 Treasury Bulletin, what were Army expenditures in FY1947?' The older file shows 7,425; the newer file shows 6,911.",
+    "source_data": "File A (April 1948): FY1947 Army = 7,425. File B (December 1952): FY1947 Army = 6,911 (restated). Question explicitly says 'Using the April 1948 Treasury Bulletin.'",
+    "should_activate": false,
+    "expected_behavior": "Skill does not activate. The question explicitly specifies the source vintage, so the agent uses 7,425 from the April 1948 bulletin as instructed.",
+    "expected_answer": "7425",
+    "expected_intermediate": [],
+    "must_check": [],
+    "must_reject": [],
+    "forbidden_outputs": [],
+    "regression_guard": ""
+  },
+  {
+    "name": "positive-structural-difference-blocks-revision-rule",
+    "scenario": "Two files have overlapping data but different reporting structures — the later file is not a restatement.",
+    "task": "Two Treasury Bulletin files are provided. File A (1948) reports FY1947 Army = 7,425 with footnote 'Air Force expenditures included under Army.' File B (1952) reports FY1947 Army = 5,800 but footnote says 'Air Force expenditures reported separately beginning FY1947.' The question asks for Army expenditures including Air Force (combined).",
+    "source_data": "File A (1948): FY1947 Army = 7,425, footnote confirms Air Force within Army. File B (1952): FY1947 Army = 5,800, footnote says Air Force separated out. Question scope: Army including Air Force.",
+    "should_activate": true,
+    "expected_behavior": "Skill activates to cross-check values. Agent discovers conflict but also discovers structural difference in footnotes (File B separates Air Force, File A combines them). Because the question asks for Army including Air Force, agent correctly selects File A's value of 7,425 — the revision-authority rule is blocked by the structural inconsistency check in step 4.",
+    "expected_answer": "7425",
+    "expected_intermediate": [
+      "Cross-checks File B for FY1947 Army",
+      "Finds conflicting values",
+      "Compares footnote treatment of Air Force across files",
+      "Identifies structural difference: File B separates Air Force, File A combines",
+      "Selects File A because its structure matches question scope (Army including Air Force)"
+    ],
+    "must_check": [
+      "Footnotes in both files regarding Air Force treatment",
+      "Question scope: does it ask for Army with or without Air Force"
+    ],
+    "must_reject": [
+      "Selecting File B's 5,800 just because it is later"
+    ],
+    "forbidden_outputs": [
+      "5800"
+    ],
+    "regression_guard": ""
+  },
+  {
+    "name": "positive-overlap-values-agree-no-op-gate",
+    "scenario": "Two files overlap but values agree — the gate is a no-op.",
+    "task": "Two Treasury Bulletin files are provided (1948 and 1952). Both show FY1940 Army expenditures = 907. The question asks for FY1940 Army expenditures.",
+    "source_data": "File A (1948): FY1940 Army = 907. File B (1952): FY1940 Army = 907.",
+    "should_activate": true,
+    "expected_behavior": "Skill activates (multiple files with overlapping time periods exist) but the check is a no-op because values agree. Agent notes the agreement and proceeds with 907 from either file.",
+    "expected_answer": "907",
+    "expected_intermediate": [
+      "Identifies target data point",
+      "Checks File B for same entity×time_period×metric",
+      "Finds identical value 907 in both files",
+      "Notes agreement and proceeds"
+    ],
+    "must_check": [],
+    "must_reject": [
+      "Insisting on using only one file when both agree",
+      "Triggering a full revision-authority resolution when values are identical"
+    ],
+    "forbidden_outputs": [],
+    "regression_guard": ""
+  }
+]

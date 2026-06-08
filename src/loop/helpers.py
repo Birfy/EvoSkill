@@ -248,6 +248,23 @@ def build_proposer_query(
             max_line_chars=700,
         )
 
+        # Include agent reasoning so the proposer can identify WHY the agent
+        # failed, not just what the final wrong answer was.
+        reasoning_section = ""
+        output = getattr(trace, "output", None)
+        if output is not None:
+            raw_reasoning = str(getattr(output, "reasoning", "") or "").strip()
+            if raw_reasoning:
+                reasoning_budget = min(1800, trace_budget // 2)
+                compacted_reasoning = compact_relevant_text(
+                    raw_reasoning,
+                    relevance_seed,
+                    max_chars=reasoning_budget,
+                    context_lines=1,
+                    max_line_chars=700,
+                )
+                reasoning_section = f"\nAgent Reasoning (chain-of-thought before final answer):\n{compacted_reasoning}\n"
+
         feedback_label = "Preserved-Surface Feedback" if induction else "Structured Failure Feedback"
         feedback_section = f"\n{feedback_label}:\n{feedback}\n" if feedback else ""
 
@@ -258,6 +275,7 @@ def build_proposer_query(
         # (error shape, likely surfaces) is exposed.
         failure_sections.append(f"""### {item_label} {i} [Category: {category}]{question_line}
 {trace_summary}
+{reasoning_section}
 {feedback_section}
 """)
 

@@ -1,0 +1,99 @@
+[
+  {
+    "name": "positive-cagr-with-rounding",
+    "scenario": "Question asks for CAGR (a named statistical operation) with explicit rounding precision. Must activate.",
+    "task": "What is the Compound Annual Growth Rate (CAGR) of Company Alpha's revenue from 2018 to 2022? Round your answer to 2 decimal places and express it as a percentage.",
+    "source_data": "Company Alpha Annual Revenue:\n\n| Year | Revenue ($M) |\n|------|-------------|\n| 2018 | 100.0       |\n| 2019 | 115.0       |\n| 2020 | 132.3       |\n| 2021 | 145.5       |\n| 2022 | 168.9       |",
+    "should_activate": true,
+    "expected_behavior": "Agent must activate the skill: identify CAGR as the named operation, state the formula CAGR = (V_final/V_initial)^(1/n) - 1, extract 100.0 and 168.9 as endpoints, use n=4 periods, compute with full-precision intermediates (carrying the result of 168.9/100.0 = 1.689 without rounding), and round only the final answer to 2 decimal places, yielding 14.00%.",
+    "expected_answer": "14.00%",
+    "expected_intermediate": [],
+    "must_check": [
+      "CAGR formula stated as (V_final/V_initial)^(1/n) - 1 or equivalent",
+      "extracts 168.9 as final value and 100.0 as initial value",
+      "uses n=4 periods for the exponent denominator",
+      "rounds final result to exactly 2 decimal places"
+    ],
+    "must_reject": [
+      "14% with only zero or one decimal place",
+      "computes simple arithmetic mean of annual growth rates instead of CAGR",
+      "14.03% (which results from averaging individual annual growth rates)"
+    ],
+    "forbidden_outputs": [
+      "14.03%"
+    ],
+    "regression_guard": "Prevents formula substitution: CAGR ≠ arithmetic mean of year-over-year growth rates. The simple average of individual growth rates gives ~14.03%, but true CAGR is 14.00%. If the agent substitutes without verifying equivalence, it will return the wrong value."
+  },
+  {
+    "name": "negative-simple-sum-two-values",
+    "scenario": "Question asks for a simple sum of exactly two values with no statistical naming and no rounding specification. Must NOT activate.",
+    "task": "What is the total of Q1 sales and Q2 sales?",
+    "source_data": "Quarterly Sales Report:\n\n| Quarter | Sales ($) |\n|---------|-----------|\n| Q1      | 45,200    |\n| Q2      | 52,800    |\n| Q3      | 61,100    |\n| Q4      | 73,400    |",
+    "should_activate": false,
+    "expected_behavior": "Agent solves directly: reads Q1 (45,200) and Q2 (52,800) from the table, adds them, and answers 98,000. No formula verification, no precision-preservation analysis, no application of the derived-statistic-verification procedure. The task is basic arithmetic with only two values and no statistical framing.",
+    "expected_answer": "$98,000",
+    "expected_intermediate": [],
+    "must_check": [
+      "reads Q1 sales of 45,200 from source",
+      "reads Q2 sales of 52,800 from source"
+    ],
+    "must_reject": [
+      "applies CAGR formula",
+      "verifies statistical formula choice",
+      "discusses intermediate precision preservation",
+      "rounds to specific decimal places that the question did not ask for"
+    ],
+    "forbidden_outputs": [],
+    "regression_guard": "Probes over-activation on any multi-value arithmetic. Simple sum of two values with no statistical naming and no rounding spec is explicitly in the Do Not Use list."
+  },
+  {
+    "name": "negative-direct-lookup-ratio",
+    "scenario": "Question uses the word 'ratio' and 'expressed as' but asks for a value already computed in the source table. Must NOT activate despite keyword match.",
+    "task": "What is the debt-to-equity ratio expressed as a decimal?",
+    "source_data": "Financial Ratios, Fiscal Year 2023:\n\n| Metric               | Value  |\n|----------------------|--------|\n| Debt-to-Equity Ratio | 0.85   |\n| Current Ratio        | 1.42   |\n| Gross Margin %       | 38.5%  |\n| Net Profit Margin %  | 12.3%  |\n| Return on Equity     | 15.7%  |",
+    "should_activate": false,
+    "expected_behavior": "Agent solves directly: reads the Debt-to-Equity Ratio value (0.85) from the table row. No computation, no formula definition. The words 'ratio' and 'expressed as' match activation-pattern keywords but the value is a direct single-cell lookup requiring zero arithmetic combination. The skill's Do Not Use rule for 'direct lookup of a single cell value' should prevent activation.",
+    "expected_answer": "0.85",
+    "expected_intermediate": [],
+    "must_check": [
+      "identifies 0.85 as the directly listed debt-to-equity ratio"
+    ],
+    "must_reject": [
+      "computes debt-to-equity ratio from raw debt and equity values",
+      "verifies a ratio formula",
+      "applies rounding to a looked-up value"
+    ],
+    "forbidden_outputs": [],
+    "regression_guard": "Probes over-triggering on keyword 'ratio' and 'expressed as' from the activation patterns: 'proportion,' 'ratio expressed as [unit]'. These keywords can appear in questions about pre-computed source values."
+  },
+  {
+    "name": "positive-tukey-inclusive-quartiles",
+    "scenario": "Question names a specific Tukey variant (inclusive) for computing quartiles with rounding precision. Must activate and must verify the correct Tukey variant.",
+    "task": "Using the Tukey inclusive method, compute Q1, Q3, and the interquartile range (IQR) for the following exam scores. Round each result to 1 decimal place.",
+    "source_data": "Exam scores for Class A (n=11 students):\n\n45, 52, 61, 67, 72, 75, 78, 83, 88, 92, 96",
+    "should_activate": true,
+    "expected_behavior": "Agent must activate the skill: identify Tukey inclusive as the named method, state the splitting rule (median is included in both the lower and upper halves), compute median=75, Q1=64.0 (median of lower half [45,52,61,67,72,75]), Q3=85.5 (median of upper half [75,78,83,88,92,96]), IQR=21.5. All values rounded to 1 decimal place. The agent must explicitly acknowledge that Tukey inclusive differs from Tukey exclusive.",
+    "expected_answer": "Q1 = 64.0, Q3 = 85.5, IQR = 21.5",
+    "expected_intermediate": [
+      "Q1 = 64.0",
+      "Q3 = 85.5",
+      "IQR = 21.5"
+    ],
+    "must_check": [
+      "explicitly states the Tukey inclusive splitting rule (median included in both halves)",
+      "identifies median = 75 correctly",
+      "computes Q1 as 64.0 using median-of-lower-half-including-median",
+      "computes Q3 as 85.5 using median-of-upper-half-including-median",
+      "computes IQR as Q3 - Q1 = 21.5",
+      "rounds each result to 1 decimal place"
+    ],
+    "must_reject": [
+      "Q1 = 61 or Q3 = 88 (these are Tukey exclusive results)",
+      "IQR = 27 (Tukey exclusive result: 88 - 61)",
+      "Q1 = 67 or Q3 = 88 (nearest-rank results)",
+      "intermediate rounding of sorted values before computing quartiles"
+    ],
+    "forbidden_outputs": [],
+    "regression_guard": "Prevents Tukey method conflation. Tukey exclusive (Q1=61, Q3=88, IQR=27) and Tukey inclusive (Q1=64.0, Q3=85.5, IQR=21.5) produce different values. If the agent does not verify which variant applies, it may silently use the wrong one."
+  }
+]

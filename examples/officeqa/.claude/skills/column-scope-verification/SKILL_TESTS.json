@@ -1,0 +1,108 @@
+[
+  {
+    "name": "negative-abbreviated-entity-name-no-subcomponent",
+    "scenario": "Negative no-activation — column header uses abbreviated entity name (qualifier omitted, not added) and no sub-component columns exist in the table",
+    "task": "The question asks: 'What was the total balance of the Unemployment Trust Fund in FY1941?' The source table columns are: [Fiscal Year, Trust Fund Balance, Total investments, Unexpended balance]. The agent correctly identifies 'Trust Fund Balance' as the target column. 'Trust Fund Balance' abbreviates 'Unemployment Trust Fund Balance' by omitting 'Unemployment' — it does NOT add a narrowing qualifier. There are no sub-component columns present.",
+    "source_data": "Column headers: Fiscal Year | Trust Fund Balance | Total investments | Unexpended balance. Row FY1941: Trust Fund Balance=1450.0, Total investments=1350.0, Unexpended balance=100.0.",
+    "should_activate": false,
+    "expected_behavior": "Skill does NOT activate. The table contains no column headers with narrowing qualifiers naming sub-components, sub-accounts, sub-regions, or sub-programs of the Unemployment Trust Fund. 'Trust Fund Balance' has the same semantic scope as 'total balance of the Unemployment Trust Fund' — the qualifier is omitted (abbreviated), not added. There is no scope-mismatch risk to catch.",
+    "expected_answer": "1450.0",
+    "expected_intermediate": [],
+    "must_check": [],
+    "must_reject": [
+      "Flagging 'Trust Fund Balance' as a scope mismatch because 'Unemployment' is missing from the header"
+    ],
+    "forbidden_outputs": [],
+    "regression_guard": "Must not treat abbreviated entity name ('Trust Fund Balance' vs 'Unemployment Trust Fund total balance') as a scope mismatch — the qualifier is omitted, not added"
+  },
+  {
+    "name": "positive-sub-region-narrowing-qualifier",
+    "scenario": "Positive activation — column header has sub-region narrowing qualifier absent from question",
+    "task": "The question asks: 'What was the total revenue for the Asia-Pacific region in each year?' The source table columns are: [Year, Revenue — Japan, Revenue — Australia, Revenue — Southeast Asia, Operating Costs — Japan, Operating Costs — Australia, Operating Costs — Southeast Asia]. The agent is considering using the 'Revenue — Japan' column as the source for 'total revenue for the Asia-Pacific region.' Japan is a sub-region of Asia-Pacific.",
+    "source_data": "Column headers: Year | Revenue — Japan | Revenue — Australia | Revenue — Southeast Asia | Operating Costs — Japan | Operating Costs — Australia | Operating Costs — Southeast Asia. Data: Year 2021: Japan=300, Australia=200, SE_Asia=150. Year 2022: Japan=320, Australia=220, SE_Asia=170. Year 2023: Japan=310, Australia=240, SE_Asia=190.",
+    "should_activate": true,
+    "expected_behavior": "Skill activates. Agent extracts question scope ('total revenue for the entire Asia-Pacific region'). Agent parses each revenue column header: 'Revenue — Japan' has narrowing qualifier 'Japan' (a sub-region), 'Revenue — Australia' has narrowing qualifier 'Australia', 'Revenue — Southeast Asia' has narrowing qualifier 'Southeast Asia'. All three have narrowing qualifiers — none directly matches the question's Asia-Pacific scope. Since no single column has the full regional scope, agent derives total by summing all three sub-region revenue columns: Japan + Australia + Southeast Asia. Agent verifies the summation is correct across all 3 years.",
+    "expected_answer": "650 (2021), 710 (2022), 740 (2023)",
+    "expected_intermediate": [
+      "Scope mismatch: 'Revenue — Japan' names a sub-region, not the full Asia-Pacific region",
+      "Total must be derived by summing all sub-region revenue columns",
+      "Verification across 2021-2023 confirms consistent derivation"
+    ],
+    "must_check": [
+      "Identify 'Japan', 'Australia', 'Southeast Asia' as narrowing sub-region qualifiers",
+      "Derive total by summing all sub-region columns, not using any single one",
+      "Verify derived total across all available years"
+    ],
+    "must_reject": [
+      "Using 'Revenue — Japan' alone as the Asia-Pacific total revenue",
+      "Assuming any single sub-region column represents the full region"
+    ],
+    "forbidden_outputs": [
+      "300",
+      "320",
+      "310"
+    ],
+    "regression_guard": ""
+  },
+  {
+    "name": "positive-coincidental-row-match-trap",
+    "scenario": "Positive activation — sub-component column coincidentally matches derived total on first 2 rows, diverging at row 3",
+    "task": "The question asks: 'What was the net income of the Corporation in each fiscal year?' Table columns: [Fiscal Year, Gross Revenue, Total Operating Expenses, Net Income — Subsidiary A, Net Income — Subsidiary B]. The agent notices that for FY2020 and FY2021, (Gross Revenue - Total Operating Expenses) equals Net Income — Subsidiary A. The agent is about to conclude that Subsidiary A's column equals the Corporation's total net income and use it for all years. The trap: this identity holds for FY2020-2021 but breaks at FY2022.",
+    "source_data": "FY2020: Gross_Revenue=5000, Op_Expenses=4200, Subsidiary_A=800, Subsidiary_B=0. FY2021: Gross_Revenue=5500, Op_Expenses=4600, Subsidiary_A=900, Subsidiary_B=0. FY2022: Gross_Revenue=6000, Op_Expenses=5000, Subsidiary_A=850, Subsidiary_B=150. FY2023: Gross_Revenue=6200, Op_Expenses=5200, Subsidiary_A=800, Subsidiary_B=200.",
+    "should_activate": true,
+    "expected_behavior": "Skill activates when agent attempts to verify column equivalence on only the first 2 rows. Agent must check the derived identity (Gross Revenue - Total Operating Expenses == Subsidiary A) across at least 3 rows spanning different conditions. Agent detects divergence at FY2022: 6000-5000=1000 but Subsidiary A=850 (difference of 150 comes from Subsidiary B). At FY2023: 6200-5200=1000 but Subsidiary A=800 (difference of 200). The equivalence is false — Subsidiary A is a sub-component, not the total. Agent correctly derives total as Gross Revenue - Total Operating Expenses (or Subsidiary A + Subsidiary B) for all years.",
+    "expected_answer": "800 (FY2020), 900 (FY2021), 1000 (FY2022), 1000 (FY2023)",
+    "expected_intermediate": [
+      "Subsidiary A has narrowing qualifier — it names one subsidiary, not the whole Corporation",
+      "Checking rows FY2020-2021: coincidental match would mislead if agent stops here",
+      "FY2022 divergence detected: derived total (1000) != Subsidiary A (850)",
+      "Correct total = Gross Revenue - Total Operating Expenses across all years"
+    ],
+    "must_check": [
+      "Verify derived equivalence on at least 3 rows spanning the full data range",
+      "Detect that Subsidiary A diverges from derived total at FY2022 and FY2023",
+      "Flag 'Net Income — Subsidiary A' as a scope mismatch (sub-component, not whole corporation)"
+    ],
+    "must_reject": [
+      "Accepting Subsidiary A as Corporation total after checking only FY2020-2021",
+      "Ignoring Subsidiary B's contribution in later years"
+    ],
+    "forbidden_outputs": [
+      "850 (for FY2022)",
+      "800 (for FY2023)",
+      "Only checking first 2 rows is sufficient"
+    ],
+    "regression_guard": ""
+  },
+  {
+    "name": "positive-ambiguous-qualifier-general-account",
+    "scenario": "Positive activation — column header has a qualifier that could be misread as 'overall' but is actually a sub-component",
+    "task": "The question asks: 'What was the total fund balance at the end of each fiscal year?' The source table columns are: [Fiscal Year, General Account Balance, Special Account Balance, Reserve Account Balance]. The agent is considering using 'General Account Balance' as the total fund balance, reasoning that 'General' means the overall/main fund. However, 'General Account' is just one of three sub-accounts — 'General' is a qualifier naming a specific account type, not a synonym for 'total.' There is no explicit total column.",
+    "source_data": "Column headers: Fiscal Year | General Account Balance | Special Account Balance | Reserve Account Balance. Data: FY2021: General=500, Special=300, Reserve=200. FY2022: General=550, Special=320, Reserve=180. FY2023: General=520, Special=350, Reserve=210.",
+    "should_activate": true,
+    "expected_behavior": "Skill activates. Agent extracts question scope ('total fund balance across all accounts'). Agent parses each column header: 'General Account Balance' has qualifier 'General' naming one specific account type, 'Special Account Balance' has qualifier 'Special', 'Reserve Account Balance' has qualifier 'Reserve'. All three are sub-component qualifiers. The word 'General' in 'General Account' is a proper name for a specific account category (like General Fund in government accounting), NOT a synonym for 'overall' or 'total.' No single column has fund-level scope, so agent must derive total as General + Special + Reserve. Agent verifies this derivation across all 3 years.",
+    "expected_answer": "1000 (FY2021), 1050 (FY2022), 1080 (FY2023)",
+    "expected_intermediate": [
+      "'General Account' is a specific account name, not a synonym for 'total fund'",
+      "All three balance columns have sub-component qualifiers (General, Special, Reserve)",
+      "No single column matches the question's fund-level scope",
+      "Total derived as General + Special + Reserve across all years"
+    ],
+    "must_check": [
+      "Identify 'General Account' as a sub-component despite the ambiguous word 'General'",
+      "Recognize that 'General', 'Special', and 'Reserve' are all narrowing qualifiers",
+      "Derive total by summing all three account columns",
+      "Verify derivation consistency across FY2021-2023"
+    ],
+    "must_reject": [
+      "Treating 'General Account Balance' as the total fund balance",
+      "Assuming 'General' means 'overall' rather than a specific account type"
+    ],
+    "forbidden_outputs": [
+      "500",
+      "550",
+      "520"
+    ],
+    "regression_guard": ""
+  }
+]
