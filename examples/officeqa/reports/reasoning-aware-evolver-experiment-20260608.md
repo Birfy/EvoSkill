@@ -2,7 +2,7 @@
 
 ## 背景
 
-上轮实验（2026-06-07）发现 iter-skill-11 在 100 条 holdout 上仅得 76%（基线 86%），退化 10 个点，根因是：
+上轮实验（2026-06-07）发现 iter-skill-11 在 100 条 holdout 上仅得 76%（基线 86%），退化 10 个点（以下旧数字均使用 `score_answer(tol=0.01) >= 0.8` 标准；本轮统一改用 `_score_multi_tolerance >= 0.8`），根因是：
 1. Skill description 命令式写法注入 system prompt 干扰全局行为
 2. DeepSeek 主动触发率 0%
 3. Evolver 生成的 Skill 全部是门控型（gate skill），无法修复计算公式错误
@@ -35,7 +35,7 @@ Agent Reasoning (chain-of-thought before final answer):
 ## Evolver 运行
 
 - 数据集：93 条训练轨迹（DeepSeek-V4-Flash，无 Skill 基线）
-- 训练集基线（Evolver 内部 BT 评分）：83.87%（78/93）；直接 score_answer() 评分：89.2%（83/93）
+- 训练集基线：83.87%（78/93）
 - 迭代数：12 轮
 - 最优节点：frontier-distilled（Judge 估计分 86.74%）
 
@@ -52,15 +52,15 @@ Agent Reasoning (chain-of-thought before final answer):
 
 ## 评估结果
 
-在同一批 193 条轨迹（100 holdout + 93 train）上分别跑新 Skill 版和纯基线版进行对比：
+在同一批 193 条轨迹（100 holdout + 93 train）上分别跑新 Skill 版和纯基线版进行对比（评分标准：`_score_multi_tolerance >= 0.8`，与 Evolver 内部一致）：
 
 | 数据集 | 新 Skill | 基线 | 差值 | Skill 触发率 |
 |---|---|---|---|---|
-| Holdout 100（未见任务） | **89.0%** | 86.0% | **+3.0%** | 53% |
-| Train 93（训练任务） | **90.3%** | 89.2% | **+1.1%** | 63% |
-| 合计 193 | **89.6%** | 87.6% | **+2.0%** | 58% |
+| Holdout 100（未见任务） | **83.0%** | 80.0% | **+3.0%** | 53% |
+| Train 93（训练任务） | **84.9%** | 83.9% | **+1.1%** | 63% |
+| 合计 193 | **83.9%** | 81.9% | **+2.1%** | 58% |
 
-与上轮 iter-skill-11（Holdout 76%，退化 10%）相比，本轮 Holdout +3.0%，完全扭转。
+与上轮 iter-skill-11（Holdout 76%，退化 10%，旧评分标准）相比，本轮 Holdout +3.0%，完全扭转。
 
 ### Skill 触发分布（193 条）
 
@@ -115,9 +115,11 @@ Evolver 在 12 轮迭代中对训练集失败的根因分析：
 
 | 版本 | Holdout 正确率 | 训练集正确率 | Skill 触发率 | 备注 |
 |---|---|---|---|---|
-| 纯基线（无 Skill） | 86.0% | 89.2% | — | DeepSeek-V4-Flash |
-| iter-skill-11（旧） | 76.0% | — | ~3% | Description 命令式，system prompt 污染 |
-| frontier-distilled（本轮） | **89.0%** | **90.3%** | **58%** | Description 被动标签 + 两阶段 Evolver |
+| 纯基线（无 Skill） | 80.0% | 83.9% | — | DeepSeek-V4-Flash |
+| iter-skill-11（旧） | 76.0%† | — | ~3% | Description 命令式，system prompt 污染 |
+| frontier-distilled（本轮） | **83.0%** | **84.9%** | **58%** | Description 被动标签 + 两阶段 Evolver |
+
+† iter-skill-11 数字使用旧评分标准（`score_answer(tol=0.01) >= 0.8`），原始轨迹已不存在，无法用新标准重算。
 
 ## 后续方向
 
