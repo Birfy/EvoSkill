@@ -39,6 +39,14 @@ class StoredTrajectory(BaseModel):
     ground_truth: str
     category: str
     agent_answer: str
+    failure_type: str = ""
+    failure_feedback: str = ""
+    failure_analysis: dict[str, Any] | None = None
+
+    # Step-level fault localization (populated by classify_failures.py)
+    fault_step: int | None = None        # 0-based index of first fault message
+    failure_behavior: str = ""           # observed failure at fault_step (π)
+    fault_type: str = ""                 # "skill_wrong" | "skill_missing" | ""
 
     # Subset of AgentTrace needed by the LLM judge (everything summarize() uses)
     trace_model: str = ""
@@ -83,13 +91,21 @@ class StoredTrajectory(BaseModel):
         )
 
     def to_extended_tuple(self):
-        """Return (AgentTrace, question, agent_answer, ground_truth, category)."""
+        """Return (AgentTrace, question, agent_answer, ground_truth, category, failure_type, failure_feedback)."""
+        feedback = self.failure_feedback
+        if not feedback and self.failure_analysis:
+            try:
+                feedback = json.dumps(self.failure_analysis, ensure_ascii=False, default=str)
+            except Exception:
+                feedback = str(self.failure_analysis)
         return (
             self.to_agent_trace(),
             self.question,
             self.agent_answer,
             self.ground_truth,
             self.category,
+            self.failure_type,
+            feedback,
         )
 
     # ------------------------------------------------------------------ #
@@ -210,24 +226,30 @@ def _extract_skill_calls(messages: list[str]) -> list[dict[str, Any]]:
             obj = json.loads(text)
         except json.JSONDecodeError:
             obj = None
-        calls.extend(_extract_skill_calls_from_obj(obj, idx) if obj is not None else [])
-
-        lowered = text.lower()
-        if "skill(" in lowered or "tool_name" in lowered and '"skill"' in lowered:
-            snippet = text[:2000]
-            calls.append(
-                {
-                    "message_index": idx,
-                    "event_type": "skill_tool_call",
-                    "skill_name": _extract_skill_name(snippet),
-                    "text": snippet,
-                }
-            )
-    return calls
+        if obj is not None:
+            calls.extend(_extract_skill_calls_from_obj(obj, idx))
+        else:
+            # Text-based fallback only when JSON parsing fails to avoid double-counting.
+            lowered = text.lower()
+            if "skill(" in lowered or ("tool_name" in lowered and '"skill"' in lowered):
+                snippet = text[:2000]
+                calls.append(
+                    {
+                        "message_index": idx,
+                        "event_type": "skill_tool_call",
+                        "skill_name": _extract_skill_name(snippet),
+                        "text": snippet,
+                    }
+                )
+    return _dedupe_skill_calls(calls)
 
 
 def _extract_skill_calls_from_obj(obj: Any, message_index: int) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
+    if isinstance(obj, list):
+        for item in obj:
+            calls.extend(_extract_skill_calls_from_obj(item, message_index))
+        return calls
     if not isinstance(obj, dict):
         return calls
 
@@ -263,6 +285,26 @@ def _extract_skill_calls_from_obj(obj: Any, message_index: int) -> list[dict[str
                 "text": text,
             }
         )
+
+    command = obj.get("command")
+    if isinstance(command, str) and "SKILL.md" in command:
+        skill_name = _extract_skill_name_from_path(command)
+        if skill_name is None:
+            skill_name = _extract_frontmatter_skill_name(str(obj.get("aggregated_output") or ""))
+        if skill_name:
+            calls.append(
+                {
+                    "message_index": message_index,
+                    "event_type": "codex_skill_file_read",
+                    "skill_name": skill_name,
+                    "payload": {"command": command},
+                    "text": command[:2000],
+                }
+            )
+
+    for value in obj.values():
+        if isinstance(value, (dict, list)):
+            calls.extend(_extract_skill_calls_from_obj(value, message_index))
     return calls
 
 
@@ -278,3 +320,37 @@ def _extract_skill_name(text: str) -> str | None:
         if match:
             return match.group(1).strip("'\" ")
     return None
+
+
+def _extract_skill_name_from_path(text: str) -> str | None:
+    """Extract a skill name from a command or path that references SKILL.md."""
+    pattern = r"\.(?:claude|agents|codex)/skills/(?:\.system/)?([A-Za-z0-9_.-]+)/SKILL\.md"
+    match = re.search(pattern, text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_frontmatter_skill_name(text: str) -> str | None:
+    """Extract a YAML-frontmatter skill name from a SKILL.md file body."""
+    match = re.search(r"(?m)^name:\s*['\"]?([A-Za-z0-9_.-]+)['\"]?\s*$", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _dedupe_skill_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the first copy of each extracted skill event."""
+    seen: set[tuple[Any, Any, Any]] = set()
+    deduped: list[dict[str, Any]] = []
+    for call in calls:
+        key = (
+            call.get("message_index"),
+            call.get("event_type"),
+            call.get("skill_name"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(call)
+    return deduped

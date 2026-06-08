@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -185,22 +186,41 @@ async def execute_query(options: dict[str, Any], query: str) -> list[Any]:
                 "modelID": options.get("model_id", "claude-sonnet-4-6"),
             },
         }
-        if options.get("system"):
-            body["system"] = options["system"]
+        system = options.get("system", "")
+        response_format = options.get("format")
+        if response_format and options.get("provider_id") == "deepseek":
+            schema = response_format.get("schema", {})
+            system = (
+                f"{system.rstrip()}\n\n"
+                "For your final response, output JSON only and match this JSON schema:\n"
+                f"{json.dumps(schema, ensure_ascii=False)}"
+            )
+        if system:
+            body["system"] = system
         if options.get("tools"):
             body["tools"] = options["tools"]
         if options.get("mode"):
             body["mode"] = options["mode"]
-        if options.get("format"):
-            body["format"] = options["format"]
+        if response_format and options.get("provider_id") != "deepseek":
+            body["format"] = response_format
 
         r = await client.post(f"/session/{session_id}/message", json=body)
-        r.raise_for_status()
+        if r.is_error:
+            raise httpx.HTTPStatusError(
+                f"{r.status_code} {r.reason_phrase}: {r.text}",
+                request=r.request,
+                response=r,
+            )
         chat_info = r.json()
 
         # 3. fetch full messages (with parts + structured output)
         r = await client.get(f"/session/{session_id}/message")
-        r.raise_for_status()
+        if r.is_error:
+            raise httpx.HTTPStatusError(
+                f"{r.status_code} {r.reason_phrase}: {r.text}",
+                request=r.request,
+                response=r,
+            )
         messages = r.json()
 
     return [{"session_id": session_id, "chat_info": chat_info, "messages": messages}]
@@ -245,7 +265,10 @@ def parse_response(
     # fallback: parse JSON from text (even if structured failed)
     if output is None and result_text.strip():
         text = result_text.strip()
-        if text.startswith("```"):
+        fenced_json = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if fenced_json:
+            text = fenced_json.group(1).strip()
+        elif text.startswith("```"):
             lines = text.splitlines()
             lines = lines[1:] if lines[0].startswith("```") else lines
             lines = lines[:-1] if lines and lines[-1].strip() == "```" else lines

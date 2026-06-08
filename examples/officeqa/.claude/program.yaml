@@ -1,0 +1,49 @@
+name: iter-skill-11
+parent: program/iter-skill-8
+generation: 3
+system_prompt:
+  type: preset
+  preset: claude_code
+  append: 'You are an expert task-solving agent. You are given a task and may be provided
+    artifacts, files, data, or tools. Use the available evidence and tools to produce
+    the requested result while respecting the task''s constraints and output format.
+
+
+    When searching large artifacts, keep command output small and targeted. Prefer
+    exact identifiers, filenames, symbols, keys, labels, error messages, or other
+    anchors from the task. Do not run broad searches that can print large sections
+    of a file tree or document. For `rg`, use narrow patterns, result limits such
+    as `-m 20`, line numbers with `-n`, and targeted files or directories. If you
+    need context, first locate relevant lines with a limited search, then inspect
+    a small range with `sed -n ''START,ENDp''`. Never emit thousands of matched lines
+    from a search command.'
+allowed_tools:
+- Read
+- Write
+- Bash
+- Glob
+- Grep
+- Edit
+- WebFetch
+- WebSearch
+- TodoWrite
+- BashOutput
+- Skill
+output_format:
+  type: json_schema
+  schema:
+    properties:
+      final_answer:
+        title: Final Answer
+        type: string
+      reasoning:
+        title: Reasoning
+        type: string
+    required:
+    - final_answer
+    - reasoning
+    title: AgentResponse
+    type: object
+metadata:
+  created_at: '2026-06-07T09:28:27.392538'
+  score: 0.8950092798840934

@@ -12,11 +12,16 @@ SDK-specific logic lives in:
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Callable, Generic, Optional, Type, TypeVar, Union
 from pydantic import BaseModel
 from .sdk_config import get_sdk, is_claude_sdk, is_codex_sdk, is_goose_sdk
 
 logger = logging.getLogger(__name__)
+
+
+def _agent_debug(message: str) -> None:
+    print(f"[AGENT-DEBUG] {message}", flush=True)
 
 # Generic type variable — every Agent[T] produces AgentTrace[T] where T is a Pydantic model
 # (e.g., AgentResponse, SkillProposerResponse, etc.)
@@ -162,23 +167,43 @@ class Agent(Generic[T]):
         options = self._get_options()
 
         sdk = get_sdk()
+        model = ""
+        if isinstance(options, dict):
+            model = str(options.get("model") or options.get("model_id") or "")
+        else:
+            model = str(
+                getattr(options, "model", None)
+                or getattr(options, "model_id", None)
+                or getattr(options, "model_name", None)
+                or ""
+            )
+        _agent_debug(
+            f"execute start sdk={sdk} model={model or '<default>'} "
+            f"response_model={self.response_model.__name__} query_chars={len(query)}"
+        )
+        started = time.monotonic()
         if sdk == "claude":
             from .claude import executor as _claude_executor
-            return await _claude_executor.execute_query(options, query)
-        if sdk == "opencode":
+            messages = await _claude_executor.execute_query(options, query)
+        elif sdk == "opencode":
             from .opencode import executor as _opencode_executor
-            return await _opencode_executor.execute_query(options, query)
-        if sdk == "openhands":
+            messages = await _opencode_executor.execute_query(options, query)
+        elif sdk == "openhands":
             from .openhands import executor as _openhands_executor
-            return await _openhands_executor.execute_query(options, query)
-        if sdk == "codex":
+            messages = await _openhands_executor.execute_query(options, query)
+        elif sdk == "codex":
             from .codex import executor as _codex_executor
-            return await _codex_executor.execute_query(options, query)
-        if sdk == "goose":
+            messages = await _codex_executor.execute_query(options, query)
+        elif sdk == "goose":
             from .goose import executor as _goose_executor
-            return await _goose_executor.execute_query(options, query)
+            messages = await _goose_executor.execute_query(options, query)
         else:
             raise ValueError(f"Unknown SDK: {sdk!r}")
+        _agent_debug(
+            f"execute done sdk={sdk} response_model={self.response_model.__name__} "
+            f"messages={len(messages)} elapsed={time.monotonic() - started:.1f}s"
+        )
+        return messages
 
     async def _run_with_retry(self, query: str) -> list[Any]:
         """Execute query with timeout and exponential backoff retry.
@@ -195,17 +220,38 @@ class Agent(Generic[T]):
 
         for attempt in range(self.max_retries):
             try:
+                _agent_debug(
+                    f"attempt {attempt + 1}/{self.max_retries} start "
+                    f"response_model={self.response_model.__name__} "
+                    f"timeout={self.timeout_seconds}s"
+                )
+                started = time.monotonic()
                 async with asyncio.timeout(self.timeout_seconds):
-                    return await self._execute_query(query)
+                    messages = await self._execute_query(query)
+                _agent_debug(
+                    f"attempt {attempt + 1}/{self.max_retries} success "
+                    f"response_model={self.response_model.__name__} "
+                    f"elapsed={time.monotonic() - started:.1f}s"
+                )
+                return messages
             except asyncio.TimeoutError:
                 last_error = TimeoutError(
                     f"Query timed out after {self.timeout_seconds}s"
+                )
+                _agent_debug(
+                    f"attempt {attempt + 1}/{self.max_retries} timeout "
+                    f"response_model={self.response_model.__name__}"
                 )
                 logger.warning(
                     f"Attempt {attempt + 1}/{self.max_retries} timed out. Retrying in {backoff}s..."
                 )
             except Exception as e:
                 last_error = e
+                _agent_debug(
+                    f"attempt {attempt + 1}/{self.max_retries} failed "
+                    f"response_model={self.response_model.__name__} "
+                    f"error={type(e).__name__}: {e}"
+                )
                 logger.warning(
                     f"Attempt {attempt + 1}/{self.max_retries} failed: {e}. Retrying in {backoff}s..."
                 )
@@ -224,9 +270,14 @@ class Agent(Generic[T]):
             2. Delegates response parsing to the active SDK's executor
             3. Returns an AgentTrace with all metadata + parsed output
         """
+        _agent_debug(f"run start response_model={self.response_model.__name__}")
         messages = await self._run_with_retry(query)
 
         sdk = get_sdk()
+        _agent_debug(
+            f"parse start sdk={sdk} response_model={self.response_model.__name__} "
+            f"messages={len(messages)}"
+        )
         if sdk == "claude":
             from .claude import executor as _claude_executor
             fields = _claude_executor.parse_response(messages, self.response_model)
@@ -244,5 +295,18 @@ class Agent(Generic[T]):
             fields = _goose_executor.parse_response(messages, self.response_model, self._get_options)
         else:
             raise ValueError(f"Unknown SDK: {sdk!r}")
+
+        _agent_debug(
+            f"parse done response_model={self.response_model.__name__} "
+            f"is_error={fields.get('is_error')} parse_error={fields.get('parse_error')!r}"
+        )
+
+        if fields.get("result") is None:
+            fields["result"] = ""
+            fields["is_error"] = True
+            fields["parse_error"] = (
+                fields.get("parse_error")
+                or "No text result returned by SDK"
+            )
 
         return AgentTrace(**fields)

@@ -18,6 +18,7 @@ from pydantic_settings import (
 )
 
 from src.loop import SelfImprovingLoop, LoopConfig, LoopAgents
+from src.loop.runner import _score_multi_tolerance  # type: ignore[attr-defined]
 from src.harness import Agent, set_sdk
 from src.agent_profiles import (
     make_base_agent_options,
@@ -25,6 +26,7 @@ from src.agent_profiles import (
     make_prompt_proposer_options,
     make_skill_generator_options,
     make_prompt_generator_options,
+    make_skill_verifier_options,
 )
 from src.agent_profiles.skill_generator import get_project_root
 from src.registry import ProgramConfig, ProgramManager
@@ -34,6 +36,7 @@ from src.schemas import (
     PromptProposerResponse,
     ToolGeneratorResponse,
     PromptGeneratorResponse,
+    SkillVerifierResponse,
 )
 
 
@@ -256,11 +259,16 @@ class LoopSettings(BaseSettings):
         default=3, description="Number of top-performing programs to keep"
     )
     no_improvement_limit: int = Field(
-        default=5, description="Stop after this many iterations without improvement"
+        default=5,
+        description=(
+            "Stop after this many iterations without improvement. Set to 0 to "
+            "disable early stopping and run the full max_iterations budget "
+            "(recommended for large PUCT/node-budget runs)."
+        ),
     )
     concurrency: int = Field(default=4, description="Number of concurrent evaluations")
     failure_samples: int = Field(
-        default=3,
+        default=2,
         description="Number of samples to test per iteration for pattern detection",
     )
     cache: bool = Field(default=True, description="Enable run caching")
@@ -307,6 +315,21 @@ class LoopSettings(BaseSettings):
             "(Anthropic → claude-haiku-4-5-20251001, OpenAI → gpt-4o-mini)."
         ),
     )
+    judge_call_timeout_seconds: int = Field(
+        default=180,
+        description=(
+            "Hard timeout for each individual LLM judge call. Timed-out calls "
+            "are marked invalid so one stuck judge request cannot stall the run."
+        ),
+    )
+    judge_max_output_tokens: int = Field(
+        default=2048,
+        description=(
+            "Maximum output tokens for each direct LLM judge call. Anthropic-compatible "
+            "models may emit thinking blocks before final text, so keep enough budget "
+            "for the required JSON verdict."
+        ),
+    )
     judge_scoring: Literal["elo", "average", "bradley_terry"] = Field(
         default="elo",
         description=(
@@ -324,9 +347,39 @@ class LoopSettings(BaseSettings):
         default=400.0,
         description="Elo logistic scale used by --judge_scoring elo.",
     )
+    judge_bt_uncertainty_penalty: float = Field(
+        default=0.05,
+        description=(
+            "Penalty multiplier applied to Bradley-Terry node scores for "
+            "sparse or low-confidence judge evidence."
+        ),
+    )
+    judge_regression_sample_multiplier: float = Field(
+        default=2.0,
+        description=(
+            "Number of previously-correct regression trajectories judged per "
+            "proposal failure."
+        ),
+    )
+    discard_on_negative_self_test_failure: bool = Field(
+        default=False,
+        description=(
+            "Hard-discard a child when an independent negative activation self-test "
+            "fails. Disabled by default: failures remain judge evidence and reduce "
+            "the score without automatically eliminating the child."
+        ),
+    )
     judge_log_details: bool = Field(
         default=True,
         description="Print per-sample judge JSON, match scores, and Elo updates.",
+    )
+    judge_holdout_ratio: float = Field(
+        default=0.5,
+        description=(
+            "Fraction of failures (per category) held out for judging only, so "
+            "the judge scores candidates on cases the proposer never saw. "
+            "Reduces overfitting/memorization. Set 0.0 to disable the split."
+        ),
     )
     judge_input_cost_per_1m: Optional[float] = Field(
         default=None,
@@ -340,6 +393,14 @@ class LoopSettings(BaseSettings):
         description=(
             "Optional direct judge output-token price in USD per 1M tokens. "
             "When omitted, known OpenAI model prices are used when available."
+        ),
+    )
+    judge_distinct_from_generator: bool = Field(
+        default=True,
+        description=(
+            "When true, switch the judge to a distinct fallback model if it matches "
+            "the skill generator model. Set false only when intentionally judging "
+            "with the same model that generated the candidate."
         ),
     )
     puct_c: float = Field(
@@ -367,6 +428,70 @@ class LoopSettings(BaseSettings):
             "Default PUCT policy prior for newly generated children. This is "
             "kept independent from judge scores so judge value only affects Q."
         ),
+    )
+    puct_overlap_prior_penalty: float = Field(
+        default=0.6,
+        description="Penalty applied to PUCT prior for proposals overlapping existing skills.",
+    )
+    puct_overlap_similarity_threshold: float = Field(
+        default=0.35,
+        description="Jaccard similarity threshold before proposal-overlap prior penalty applies.",
+    )
+    use_playbook: bool = Field(
+        default=True,
+        description=(
+            "Enable the learned playbook/memory used by the evolver. Set false "
+            "to make each proposal depend only on the selected trajectories and parent skills."
+        ),
+    )
+    failure_selection: Literal["round_robin", "bandit"] = Field(
+        default="bandit",
+        description=(
+            "Failure-family sampler. 'bandit' prioritizes historically promising "
+            "families; 'round_robin' cycles deterministically across families."
+        ),
+    )
+    frontier_mode: Literal["scalar", "qd"] = Field(
+        default="qd",
+        description=(
+            "Frontier maintenance mode for non-Bradley-Terry scoring. 'qd' keeps "
+            "category niches; 'scalar' keeps only top global scores."
+        ),
+    )
+    distill_frontier_at_end: bool = Field(
+        default=True,
+        description="Distill the strongest frontier programs into one final validated skill.",
+    )
+    frontier_distill_top_k: int = Field(
+        default=4,
+        description="Maximum frontier programs included in final skill distillation.",
+    )
+    frontier_distill_judge_failures: int = Field(
+        default=4,
+        description="Held-out failure cases used to validate the distilled skill.",
+    )
+    frontier_distill_judge_regressions: int = Field(
+        default=4,
+        description="Previously-correct cases used to validate the distilled skill.",
+    )
+    executable_skill_tests: bool = Field(
+        default=True,
+        description=(
+            "Run generated SKILL_TESTS.json as executable synthetic agent tasks "
+            "and feed the measured pass rate into the judge."
+        ),
+    )
+    executable_skill_test_max_cases: int = Field(
+        default=4,
+        description="Maximum generated skill self-tests to execute per candidate.",
+    )
+    executable_skill_test_concurrency: int = Field(
+        default=2,
+        description="Concurrency for executable generated skill self-tests.",
+    )
+    executable_skill_test_timeout_seconds: int = Field(
+        default=240,
+        description="Timeout for one executable generated skill self-test.",
     )
     trajectories_dir: Optional[str] = Field(
         default=None,
@@ -432,12 +557,26 @@ def stratified_split(
 
 
 def train_pools_from_trajectories(
-    trajectories: list[tuple[Any, str, str, str, str]],
+    trajectories: list[tuple[Any, str, str, str, str, str]],
 ) -> dict[str, list[tuple[str, str]]]:
-    """Build the minimal train pool required by the loop from stored trajectories."""
+    """Build the minimal train pool required by the loop from stored trajectories.
+
+    For LLM-judge runs, derive categories from outcome/failure mechanism instead
+    of trusting benchmark-provided categories such as difficulty.
+    """
     train_pools: dict[str, list[tuple[str, str]]] = {}
     seen: set[tuple[str, str, str]] = set()
-    for _trace, question, _agent_answer, ground_truth, category in trajectories:
+    for _trace, question, agent_answer, ground_truth, category, *rest in trajectories:
+        score = _score_multi_tolerance(
+            question,
+            str(agent_answer).strip().lower(),
+            str(ground_truth).strip().lower(),
+        )
+        if score >= 0.8:
+            category = "success"
+        else:
+            failure_type = str(rest[0] or "").strip() if rest else ""
+            category = failure_type or "unclassified_failure"
         key = (question, ground_truth, category)
         if key in seen:
             continue
@@ -524,6 +663,10 @@ async def main(settings: LoopSettings):
             make_prompt_generator_options(project_root=project_root, model=settings.model),
             PromptGeneratorResponse,
         ),
+        skill_verifier=Agent(
+            make_skill_verifier_options(project_root=project_root, model=settings.model),
+            SkillVerifierResponse,
+        ),
     )
     if os.getenv("EVOSKILL_NO_GIT") == "1":
         print("Using LocalProgramManager (EVOSKILL_NO_GIT=1)")
@@ -544,17 +687,37 @@ async def main(settings: LoopSettings):
         continue_mode=settings.continue_loop,
         use_llm_judge=settings.use_llm_judge,
         judge_model=settings.judge_model,
+        judge_call_timeout_seconds=settings.judge_call_timeout_seconds,
+        judge_max_output_tokens=settings.judge_max_output_tokens,
         judge_scoring=settings.judge_scoring,
         judge_elo_k=settings.judge_elo_k,
         judge_elo_scale=settings.judge_elo_scale,
+        judge_bt_uncertainty_penalty=settings.judge_bt_uncertainty_penalty,
+        judge_regression_sample_multiplier=settings.judge_regression_sample_multiplier,
+        discard_on_negative_self_test_failure=settings.discard_on_negative_self_test_failure,
         judge_log_details=settings.judge_log_details,
+        judge_holdout_ratio=settings.judge_holdout_ratio,
         judge_input_cost_per_1m=settings.judge_input_cost_per_1m,
         judge_output_cost_per_1m=settings.judge_output_cost_per_1m,
+        judge_distinct_from_generator=settings.judge_distinct_from_generator,
         puct_c=settings.puct_c,
         puct_max_depth=settings.puct_max_depth,
         puct_children_per_node=settings.puct_children_per_node,
         children_per_iteration=settings.children_per_iteration,
         puct_default_prior=settings.puct_default_prior,
+        puct_overlap_prior_penalty=settings.puct_overlap_prior_penalty,
+        puct_overlap_similarity_threshold=settings.puct_overlap_similarity_threshold,
+        use_playbook=settings.use_playbook,
+        failure_selection=settings.failure_selection,
+        frontier_mode=settings.frontier_mode,
+        distill_frontier_at_end=settings.distill_frontier_at_end,
+        frontier_distill_top_k=settings.frontier_distill_top_k,
+        frontier_distill_judge_failures=settings.frontier_distill_judge_failures,
+        frontier_distill_judge_regressions=settings.frontier_distill_judge_regressions,
+        executable_skill_tests=settings.executable_skill_tests,
+        executable_skill_test_max_cases=settings.executable_skill_test_max_cases,
+        executable_skill_test_concurrency=settings.executable_skill_test_concurrency,
+        executable_skill_test_timeout_seconds=settings.executable_skill_test_timeout_seconds,
     )
 
     model_info = f", model={settings.model}" if settings.model else ""
@@ -578,6 +741,7 @@ async def main(settings: LoopSettings):
         f"trajectory=${result.trajectory_cost_usd:.4f}, "
         f"preloaded=${result.preloaded_trajectory_cost_usd:.4f}, "
         f"evolution=${result.evolution_agent_cost_usd:.4f}, "
+        f"self_test=${result.self_test_cost_usd:.4f}, "
         f"judge=${result.judge_cost_usd:.4f}, "
         f"judge_tokens={result.judge_total_tokens} "
         f"(in={result.judge_prompt_tokens}, out={result.judge_completion_tokens})"

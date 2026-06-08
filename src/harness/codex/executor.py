@@ -27,11 +27,135 @@ How Codex differs from Claude and OpenCode:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Callable, Type
 
 from pydantic import BaseModel, ValidationError
 
 from ..provider_auth import ensure_provider_api_key
+
+
+def _codex_stream_log_enabled() -> bool:
+    value = os.getenv("EVOSKILL_CODEX_STREAM_LOG", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+# The Codex SDK spawns the CLI with the asyncio default StreamReader limit
+# (64 KiB) and reads stdout one JSONL event per readline(). Any event larger
+# than the limit raises a ValueError and aborts the call. 64 MiB gives ample
+# headroom for large structured outputs while still bounding memory use.
+_CODEX_STREAM_LIMIT = 64 * 1024 * 1024
+
+
+def _ensure_codex_stream_limit() -> None:
+    """Patch the Codex SDK's subprocess spawn to use a larger stream limit.
+
+    Idempotent: only wraps create_subprocess_exec once per process.
+    """
+    import functools
+
+    try:
+        from openai_codex_sdk import exec as _codex_exec
+
+        original = _codex_exec.asyncio.create_subprocess_exec
+    except (ImportError, AttributeError):
+        # SDK internals not shaped as expected (e.g. a test double, or a
+        # future SDK version). Nothing to patch — fall back to defaults.
+        return
+
+    if getattr(original, "_evoskill_stream_limit_patched", False):
+        return
+
+    @functools.wraps(original)
+    async def _patched_create_subprocess_exec(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("limit", _CODEX_STREAM_LIMIT)
+        return await original(*args, **kwargs)
+
+    _patched_create_subprocess_exec._evoskill_stream_limit_patched = True  # type: ignore[attr-defined]
+    _codex_exec.asyncio.create_subprocess_exec = _patched_create_subprocess_exec
+
+
+def _truncate_log_text(text: str, *, max_chars: int = 2000) -> str:
+    cleaned = text.rstrip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return f"{cleaned[:max_chars]}... [truncated {len(cleaned) - max_chars} chars]"
+
+
+def _print_codex_event(event: Any) -> None:
+    event_type = getattr(event, "type", type(event).__name__)
+    if event_type == "thread.started":
+        print(f"[codex] thread.started id={getattr(event, 'thread_id', '')}", flush=True)
+        return
+    if event_type == "turn.started":
+        print("[codex] turn.started", flush=True)
+        return
+    if event_type == "turn.completed":
+        usage = getattr(event, "usage", None)
+        if usage is not None:
+            in_tokens = getattr(usage, "input_tokens", "?")
+            out_tokens = getattr(usage, "output_tokens", "?")
+            cached = getattr(usage, "cached_input_tokens", "?")
+            print(
+                f"[codex] turn.completed input={in_tokens} cached={cached} output={out_tokens}",
+                flush=True,
+            )
+        else:
+            print("[codex] turn.completed", flush=True)
+        return
+    if event_type == "turn.failed":
+        error = getattr(event, "error", None)
+        message = getattr(error, "message", error)
+        print(f"[codex] turn.failed {message}", flush=True)
+        return
+    if event_type == "error":
+        print(f"[codex] error {getattr(event, 'message', '')}", flush=True)
+        return
+
+    item = getattr(event, "item", None)
+    if item is None:
+        print(f"[codex] {event_type}", flush=True)
+        return
+
+    item_type = getattr(item, "type", type(item).__name__)
+    prefix = f"[codex] {event_type} {item_type}"
+    if item_type == "command_execution":
+        command = _truncate_log_text(getattr(item, "command", ""), max_chars=400)
+        status = getattr(item, "status", "")
+        exit_code = getattr(item, "exit_code", None)
+        print(f"{prefix} status={status} exit={exit_code} cmd={command!r}", flush=True)
+        output = getattr(item, "aggregated_output", "")
+        if output:
+            print(f"[codex] command.output\n{_truncate_log_text(output)}", flush=True)
+        return
+    if item_type == "agent_message":
+        text = getattr(item, "text", "")
+        print(f"{prefix}\n{_truncate_log_text(text)}", flush=True)
+        return
+    if item_type == "reasoning":
+        text = getattr(item, "text", "")
+        print(f"{prefix}\n{_truncate_log_text(text, max_chars=800)}", flush=True)
+        return
+    if item_type == "file_change":
+        changes = getattr(item, "changes", [])
+        formatted = ", ".join(
+            f"{getattr(change, 'kind', '?')}:{getattr(change, 'path', '?')}"
+            for change in changes
+        )
+        print(f"{prefix} status={getattr(item, 'status', '')} {formatted}", flush=True)
+        return
+    if item_type == "mcp_tool_call":
+        print(
+            f"{prefix} {getattr(item, 'server', '')}.{getattr(item, 'tool', '')} "
+            f"status={getattr(item, 'status', '')}",
+            flush=True,
+        )
+        return
+    if item_type == "web_search":
+        print(f"{prefix} query={getattr(item, 'query', '')!r}", flush=True)
+        return
+
+    print(f"{prefix}", flush=True)
 
 
 async def execute_query(options: dict[str, Any], query: str) -> list[Any]:
@@ -67,6 +191,15 @@ async def execute_query(options: dict[str, Any], query: str) -> list[Any]:
     # opencode/executor.py.
     from openai_codex_sdk import Codex
 
+    # The Codex SDK reads the CLI's stdout line-by-line as newline-delimited
+    # JSON (see openai_codex_sdk/exec.py). It spawns the subprocess without a
+    # `limit=`, so the asyncio StreamReader uses the 64 KiB default. A single
+    # JSON event larger than that (big structured output, large diffs, long
+    # judge reasoning) makes readline() raise
+    # `ValueError: Separator is not found, and chunk exceed the limit`, which
+    # crashes judge/proposer calls. Raise the limit before any thread runs.
+    _ensure_codex_stream_limit()
+
     if not isinstance(options, dict):
         raise TypeError(f"Codex SDK requires dict options, got {type(options)}")
 
@@ -80,7 +213,17 @@ async def execute_query(options: dict[str, Any], query: str) -> list[Any]:
     # Create a new Codex instance and start a thread.
     # Unlike OpenCode (which manages a persistent HTTP server), Codex
     # handles its own process lifecycle internally.
-    codex = Codex({"api_key": api_key})
+    import os
+    import shutil
+
+    codex_options: dict[str, Any] = {"api_key": api_key}
+    base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("API_BASE_URL")
+    if base_url:
+        codex_options["base_url"] = base_url
+    codex_path = os.environ.get("CODEX_PATH_OVERRIDE") or shutil.which("codex")
+    if codex_path:
+        codex_options["codex_path_override"] = codex_path
+    codex = Codex(codex_options)
     thread_opts: dict[str, Any] = {
         "working_directory": options.get("working_directory", "."),
     }
@@ -105,7 +248,39 @@ async def execute_query(options: dict[str, Any], query: str) -> list[Any]:
     #   .items — tool call results (file reads, bash executions, etc.)
     system_prompt = str(options.get("system") or "").strip()
     prompt = f"{system_prompt}\n\n{query}" if system_prompt else query
-    turn = await thread.run(prompt, run_opts)
+    if _codex_stream_log_enabled():
+        from openai_codex_sdk.thread import Turn
+
+        stream = await thread.run_streamed(prompt, run_opts)
+        items: list[Any] = []
+        final_response = ""
+        usage = None
+        failure_message: str | None = None
+
+        async for event in stream.events:
+            _print_codex_event(event)
+            event_type = getattr(event, "type", "")
+            if event_type == "item.completed":
+                item = getattr(event, "item", None)
+                if item is not None:
+                    if getattr(item, "type", "") == "agent_message":
+                        final_response = getattr(item, "text", "") or final_response
+                    items.append(item)
+            elif event_type == "turn.completed":
+                usage = getattr(event, "usage", None)
+            elif event_type == "turn.failed":
+                error = getattr(event, "error", None)
+                failure_message = str(getattr(error, "message", error))
+                break
+            elif event_type == "error":
+                failure_message = str(getattr(event, "message", "Codex stream error"))
+                break
+
+        if failure_message:
+            raise RuntimeError(failure_message)
+        turn = Turn(items=items, final_response=final_response, usage=usage)
+    else:
+        turn = await thread.run(prompt, run_opts)
 
     # Wrap in list for consistency with other executors.
     # Agent.run() always receives list[Any] and passes it to parse_response().

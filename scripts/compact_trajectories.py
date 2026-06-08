@@ -16,6 +16,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from src.loop.helpers import build_answer_comparison_feedback
 from src.loop.runner import _score_multi_tolerance
 from src.schemas.trajectory import _extract_skill_calls
 
@@ -59,6 +60,22 @@ def compact_record(raw: dict[str, Any], max_actions: int, max_text: int) -> dict
     score = _score_multi_tolerance(question, predicted.strip().lower(), expected.strip().lower())
     passed = score >= 0.8
     failure_reason = None if passed else classify_failure(raw, predicted, expected, score)
+    failure_feedback = None
+    failure_analysis = None
+    if failure_reason is not None:
+        failure_feedback = build_answer_comparison_feedback(
+            question,
+            predicted,
+            expected,
+            failure_reason,
+        )
+        failure_analysis = {
+            "failure_type": failure_reason,
+            "predicted_answer": predicted,
+            "expected_answer": expected,
+            "eval_score": score,
+            "feedback": failure_feedback,
+        }
 
     trace_messages = [str(m) for m in raw.get("trace_messages") or []]
     skill_calls = _extract_skill_calls(trace_messages)
@@ -75,12 +92,16 @@ def compact_record(raw: dict[str, Any], max_actions: int, max_text: int) -> dict
         "task_id": raw.get("task_id"),
         "category": raw.get("category") or raw.get("domain"),
         "question": question,
+        "ground_truth": expected,
+        "agent_answer": predicted,
         "expected_answer": expected,
         "predicted_answer": predicted,
         "eval_score": score,
         "passed": passed,
         "failure_reason": failure_reason,
-        "failure_feedback": build_failure_feedback(predicted, expected, score, failure_reason),
+        "failure_type": failure_reason or "",
+        "failure_feedback": failure_feedback,
+        "failure_analysis": failure_analysis,
         "trace_model": raw.get("trace_model"),
         "trace_num_turns": raw.get("trace_num_turns"),
         "trace_duration_ms": raw.get("trace_duration_ms"),
@@ -110,20 +131,6 @@ def classify_failure(raw: dict[str, Any], predicted: str, expected: str, score: 
     if pred_nums and exp_nums:
         return "NUMERIC_MISMATCH_CLOSE" if score > 0 else "NUMERIC_MISMATCH"
     return "TEXT_MISMATCH"
-
-
-def build_failure_feedback(
-    predicted: str,
-    expected: str,
-    score: float,
-    failure_reason: str | None,
-) -> str | None:
-    if failure_reason is None:
-        return None
-    return (
-        f"{failure_reason}: predicted {predicted!r}, expected {expected!r}, "
-        f"score={score:.3f}."
-    )
 
 
 def extract_actions(messages: list[str], *, max_actions: int, max_text: int) -> list[dict[str, Any]]:

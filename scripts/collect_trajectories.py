@@ -34,6 +34,7 @@ from src.agent_profiles.base_agent.base_agent import make_base_agent_options_fro
 from src.agent_profiles.skill_generator import get_project_root
 from src.schemas import AgentResponse
 from src.schemas.trajectory import StoredTrajectory
+from src.loop.runner import _score_multi_tolerance  # type: ignore[attr-defined]
 
 
 class CollectSettings(BaseSettings):
@@ -74,7 +75,19 @@ class CollectSettings(BaseSettings):
     )
     category_column: str = Field(
         default="category",
-        description="CSV column name for categories (added as 'default' if missing)",
+        description="CSV column name for dataset categories when category_mode='dataset'",
+    )
+    category_mode: Literal["dataset", "none", "outcome"] = Field(
+        default="dataset",
+        description=(
+            "How to assign trajectory categories: dataset=use CSV category, "
+            "none=store all as unclassified, outcome=success vs unclassified_failure "
+            "after scoring"
+        ),
+    )
+    score_threshold: float = Field(
+        default=0.8,
+        description="Score threshold used by category_mode='outcome' to mark success",
     )
     uid_column: Optional[str] = Field(
         default=None,
@@ -96,6 +109,22 @@ class CollectSettings(BaseSettings):
         default=True,
         description="Resume from existing trajectories.jsonl in output_dir",
     )
+    agent_timeout_seconds: int = Field(
+        default=900,
+        description="Timeout for each single agent attempt in seconds.",
+    )
+    agent_max_retries: int = Field(
+        default=2,
+        description="Maximum agent attempts per task before writing a failed trajectory.",
+    )
+    task_timeout_seconds: int = Field(
+        default=1200,
+        description="Hard timeout for one dataset row including retries before writing a failed trajectory.",
+    )
+    skill_reminder: bool = Field(
+        default=False,
+        description="Append a skill-check reminder to every query so the model proactively invokes applicable skills.",
+    )
 
 
 def load_dataset(settings: CollectSettings) -> list[tuple[str, str, str, str]]:
@@ -110,10 +139,16 @@ def load_dataset(settings: CollectSettings) -> list[tuple[str, str, str, str]]:
     if renames:
         data.rename(columns=renames, inplace=True)
 
-    if settings.category_column in data.columns and settings.category_column != "category":
-        data.rename(columns={settings.category_column: "category"}, inplace=True)
-    elif "category" not in data.columns:
-        data["category"] = "default"
+    if settings.category_mode == "dataset":
+        if settings.category_column in data.columns and settings.category_column != "category":
+            data.rename(columns={settings.category_column: "category"}, inplace=True)
+        elif "category" not in data.columns:
+            data["category"] = "default"
+    else:
+        # Do not import benchmark/dataset-defined difficulty or categories into
+        # evolution. The final persisted category is assigned after inference
+        # in outcome mode, or kept neutral in none mode.
+        data["category"] = "unclassified"
 
     uid_col = settings.uid_column
     if uid_col and uid_col in data.columns:
@@ -174,7 +209,12 @@ async def collect(settings: CollectSettings) -> list[StoredTrajectory]:
             if settings.model or settings.data_dir or settings.project_root
             else base_agent_options
         )
-    agent: Agent[AgentResponse] = Agent(base_options, AgentResponse)
+    agent: Agent[AgentResponse] = Agent(
+        base_options,
+        AgentResponse,
+        timeout_seconds=settings.agent_timeout_seconds,
+        max_retries=settings.agent_max_retries,
+    )
 
     semaphore = asyncio.Semaphore(settings.concurrency)
     lock = asyncio.Lock()
@@ -185,9 +225,30 @@ async def collect(settings: CollectSettings) -> list[StoredTrajectory]:
         nonlocal total_cost
         async with semaphore:
             try:
-                trace = await agent.run(question)
+                async with asyncio.timeout(settings.task_timeout_seconds):
+                    q = question
+                    if settings.skill_reminder:
+                        q = q + "\n\nBefore starting, check if any available skill applies to this task and invoke it using the Skill tool."
+                    trace = await agent.run(q)
+            except asyncio.TimeoutError as e:
+                print(
+                    f"\n[WARN] Agent timed out on '{question[:60]}...': {e}",
+                    flush=True,
+                )
+                # Return a failed trajectory so the record is preserved
+                from src.harness.agent import AgentTrace
+                trace = AgentTrace(
+                    duration_ms=0,
+                    total_cost_usd=0.0,
+                    num_turns=0,
+                    usage={},
+                    result="",
+                    is_error=True,
+                    parse_error=f"task timeout after {settings.task_timeout_seconds}s",
+                    messages=[],
+                )
             except Exception as e:
-                print(f"\n[WARN] Agent failed on '{question[:60]}...': {e}")
+                print(f"\n[WARN] Agent failed on '{question[:60]}...': {e}", flush=True)
                 # Return a failed trajectory so the record is preserved
                 from src.harness.agent import AgentTrace
                 trace = AgentTrace(
@@ -207,14 +268,28 @@ async def collect(settings: CollectSettings) -> list[StoredTrajectory]:
                 if trace.output and trace.output.final_answer
                 else "[PARSE FAILED]"
             )
+            stored_category = category
+            if settings.category_mode == "outcome":
+                score = _score_multi_tolerance(
+                    question,
+                    agent_answer.strip().lower(),
+                    ground_truth.strip().lower(),
+                )
+                if score >= settings.score_threshold:
+                    stored_category = "success"
+                else:
+                    stored_category = "unclassified_failure"
+            elif settings.category_mode == "none":
+                stored_category = "unclassified"
+
             return StoredTrajectory.from_trace(
                 trace=trace,
                 question=question,
                 ground_truth=ground_truth,
-                category=category,
+                category=stored_category,
                 agent_answer=agent_answer,
                 task_id=uid,
-                domain=category,
+                domain=stored_category,
             )
 
     async def run_and_save(uid: str, question: str, ground_truth: str, category: str) -> StoredTrajectory:

@@ -1,7 +1,9 @@
 """Tests for src/harness/ — AgentTrace, Agent, sdk_config, options_utils."""
 
 import asyncio
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +16,7 @@ from src.harness.sdk_config import (
     set_sdk,
 )
 from src.harness.agent import AgentTrace, Agent
+from src.harness.claude.executor import _prepare_claude_provider_env
 
 
 # ===========================================================================
@@ -33,6 +36,33 @@ class TestSdkConfig:
 
     def test_default_sdk_is_claude(self):
         assert get_sdk() == "claude"
+
+
+class TestClaudeDeepSeekEnv:
+    def test_deepseek_auth_token_maps_to_anthropic_api_key(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-deepseek-key")
+
+        _prepare_claude_provider_env(SimpleNamespace(model="deepseek-v4-flash"))
+
+        assert os.environ["ANTHROPIC_API_KEY"] == "test-deepseek-key"
+        assert os.environ["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+
+    def test_deepseek_missing_key_fails_fast(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+        with pytest.raises(RuntimeError, match="Claude Code DeepSeek model requires"):
+            _prepare_claude_provider_env(SimpleNamespace(model="deepseek-v4-flash"))
+
+    def test_non_deepseek_model_does_not_require_key(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+        _prepare_claude_provider_env(SimpleNamespace(model="claude-sonnet-4-6"))
 
     def test_is_claude_sdk_true_by_default(self):
         assert is_claude_sdk() is True
@@ -343,6 +373,25 @@ class TestOptionsUtils:
         result = resolve_data_dirs(tmp_path, [abs_path])
         assert abs_path in result
 
+    def test_resolve_data_dirs_prefers_existing_cwd_relative_path(
+        self, tmp_path, monkeypatch
+    ):
+        from src.harness.utils import resolve_data_dirs
+
+        repo = tmp_path / "repo"
+        clean_root = tmp_path / "clean"
+        data_dir = repo / "examples" / "officeqa" / "data"
+        data_dir.mkdir(parents=True)
+        clean_root.mkdir()
+        monkeypatch.chdir(repo)
+
+        result = resolve_data_dirs(
+            clean_root,
+            ["examples/officeqa/data"],
+        )
+
+        assert result == [str(data_dir.resolve())]
+
     def test_split_opencode_model_with_slash(self):
         from src.harness.opencode.options import split_opencode_model
 
@@ -450,7 +499,9 @@ from src.harness.opencode.executor import parse_response as opencode_parse
 from src.schemas import AgentResponse, SkillProposerResponse
 
 
-def _make_claude_messages(structured_output=None, is_error=False):
+def _make_claude_messages(
+    structured_output=None, is_error=False, result="some result text"
+):
     first = types.SimpleNamespace(
         data={"uuid": "test-uuid", "model": "sonnet", "tools": ["Read", "Bash"]}
     )
@@ -460,7 +511,7 @@ def _make_claude_messages(structured_output=None, is_error=False):
         total_cost_usd=0.05,
         num_turns=3,
         usage={"input": 100, "output": 50},
-        result="some result text",
+        result=result,
         is_error=is_error,
         structured_output=structured_output,
     )
@@ -494,6 +545,15 @@ class TestClaudeParseResponse:
         assert "No structured output" in fields["parse_error"]
         assert fields["is_error"] is True
 
+    def test_handles_empty_result_without_crashing_trace_construction(self):
+        msgs = _make_claude_messages(structured_output=None, result=None)
+        fields = claude_parse(msgs, AgentResponse)
+        trace = AgentTrace(**fields)
+        assert trace.result == ""
+        assert trace.output is None
+        assert "No structured output or text result" in trace.parse_error
+        assert trace.is_error is True
+
     def test_handles_invalid_structured_output(self):
         msgs = _make_claude_messages({"wrong_field": "value"})
         fields = claude_parse(msgs, AgentResponse)
@@ -506,6 +566,10 @@ class TestClaudeParseResponse:
             "target_skill": None,
             "proposed_skill": "calculator",
             "justification": "needed for math",
+            "should_apply_when": "Use when arithmetic requires explicit calculation.",
+            "should_not_apply_when": "Do not use when no arithmetic is needed.",
+            "invariants_to_preserve": "Preserve requested units, operands, formula, and rounding.",
+            "regression_risks": "Could over-apply to simple lookup tasks.",
             "related_iterations": ["iter-1"],
         }
         msgs = _make_claude_messages(structured_output=data)
@@ -619,6 +683,10 @@ class TestOpencodeParseResponse:
         data = {
             "action": "edit", "target_skill": "math-helper",
             "proposed_skill": "improved calculator", "justification": "needs fixing",
+            "should_apply_when": "Use when arithmetic requires explicit calculation.",
+            "should_not_apply_when": "Do not use when no arithmetic is needed.",
+            "invariants_to_preserve": "Preserve requested units, operands, formula, and rounding.",
+            "regression_risks": "Could over-apply to simple lookup tasks.",
             "related_iterations": [],
         }
         payload = _make_opencode_payload(info={"structured_output": data, "cost": 0.05, "tokens": {}})

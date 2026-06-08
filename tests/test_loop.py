@@ -9,12 +9,45 @@ from unittest.mock import MagicMock
 # LoopConfig — dataclass defaults and field types
 # ===========================================================================
 
+class TestNoImprovementStop:
+    """Early-stop guard: a falsy limit disables it entirely."""
+
+    def test_fires_at_limit(self):
+        from src.loop.runner import _no_improvement_stop
+
+        assert _no_improvement_stop(5, 5) is True
+        assert _no_improvement_stop(6, 5) is True
+
+    def test_does_not_fire_below_limit(self):
+        from src.loop.runner import _no_improvement_stop
+
+        assert _no_improvement_stop(4, 5) is False
+
+    def test_disabled_when_limit_zero(self):
+        from src.loop.runner import _no_improvement_stop
+
+        # Must NOT fire even when the count is huge — runs the full budget.
+        assert _no_improvement_stop(0, 0) is False
+        assert _no_improvement_stop(999, 0) is False
+
+    def test_disabled_when_limit_none(self):
+        from src.loop.runner import _no_improvement_stop
+
+        assert _no_improvement_stop(999, None) is False
+
+
 class TestLoopConfig:
     def test_default_max_iterations(self):
         from src.loop.config import LoopConfig
 
         config = LoopConfig()
         assert config.max_iterations == 5
+
+    def test_no_improvement_limit_accepts_zero_and_none(self):
+        from src.loop.config import LoopConfig
+
+        assert LoopConfig(no_improvement_limit=0).no_improvement_limit == 0
+        assert LoopConfig(no_improvement_limit=None).no_improvement_limit is None
 
     def test_default_frontier_size(self):
         from src.loop.config import LoopConfig
@@ -109,6 +142,15 @@ class TestLoopConfig:
         from src.loop.config import LoopConfig
 
         assert LoopConfig().consecutive_proposer_failures_limit == 5
+
+    def test_executable_skill_tests_defaults(self):
+        from src.loop.config import LoopConfig
+
+        config = LoopConfig()
+        assert config.executable_skill_tests is True
+        assert config.executable_skill_test_max_cases == 4
+        assert config.executable_skill_test_concurrency == 2
+        assert config.executable_skill_test_timeout_seconds == 240
 
 
 def test_multi_tolerance_scorer_empty_prediction_scores_zero() -> None:
@@ -270,6 +312,37 @@ class TestBuildProposerQuery:
             traces, "", truncation_level=2, project_root=tmp_path
         )
         assert len(result_agg) <= len(result_full)
+
+    def test_truncation_level_reduces_existing_skill_context(self, tmp_path):
+        from src.loop.helpers import build_proposer_query
+
+        skill_dir = tmp_path / ".claude" / "skills" / "large-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Skill\n" + ("rule text\n" * 800))
+        traces = [(_make_trace("short"), "a", "gt", "cat")]
+
+        result_full = build_proposer_query(
+            traces, "", truncation_level=0, project_root=tmp_path
+        )
+        result_agg = build_proposer_query(
+            traces, "", truncation_level=2, project_root=tmp_path
+        )
+
+        assert len(result_agg) < len(result_full)
+        assert "truncated for proposer retry" in result_agg
+
+    def test_playbook_disabled_requires_empty_bullet_ops(self, tmp_path):
+        from src.loop.helpers import build_proposer_query
+
+        result = build_proposer_query(
+            [(_make_trace(), "a", "gt", "cat")],
+            "",
+            project_root=tmp_path,
+            use_playbook=False,
+        )
+
+        assert "Playbook mode is disabled" in result
+        assert "bullet_ops=[]" in result
 
     def test_task_constraints_included(self, tmp_path):
         from src.loop.helpers import build_proposer_query
@@ -581,6 +654,20 @@ class TestBuildJudgeQuery:
         assert "Proposer Deep Analysis" not in query
         assert "justification" not in query.lower()
 
+    def test_regression_case_is_described_as_preservation_only(self):
+        from src.loop.helpers import build_judge_query
+
+        query = build_judge_query(
+            trace_summary="trace",
+            question="question",
+            agent_answer="correct",
+            ground_truth="correct",
+            case_type="regression",
+        )
+
+        assert "preservation check" in query
+        assert "do NOT score the including set higher" in query
+
 
 # ===========================================================================
 # build_prompt_query_from_prompt_proposer
@@ -684,6 +771,7 @@ class TestRefineAndJudgeConfig:
         assert c.refine_max_rounds == 1
         assert c.refine_root_cause_threshold == 0.5
         assert c.refine_generalization_threshold == 0.55
+        assert c.refine_self_test_threshold == 0.55
         # Streamlining defaults: swap off, no inherited-failure superset.
         assert c.judge_position_swap is False
         assert c.judge_inherit_parent_failures is False
@@ -717,6 +805,552 @@ class TestMisleadingWorkedExample:
         assert SelfImprovingLoop._has_misleading_worked_example("") is False
 
 
+class TestMaterializeGeneratedSkill:
+    def test_writes_skill_tests_json_from_pydantic_items(self, tmp_path):
+        import json
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import ToolGeneratorResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop._project_root = tmp_path
+        loop.config = LoopConfig(validate_worked_examples=False)
+
+        output = ToolGeneratorResponse(
+            generated_skill="derived-numeric-contract",
+            reasoning="Need a portable numeric contract.",
+            skill_markdown=(
+                "---\n"
+                "name: derived-numeric-contract\n"
+                "description: Validate derived numeric calculations.\n"
+                "---\n\n"
+                "# derived-numeric-contract\n"
+            ),
+            skill_tests=[
+                {
+                    "name": "negative direct lookup",
+                    "scenario": "A source prints the final answer directly.",
+                    "should_activate": False,
+                    "expected_behavior": "Do not force a derivation contract.",
+                    "must_check": ["final quantity is already printed"],
+                    "must_reject": ["inventing arithmetic"],
+                    "regression_guard": "Direct lookup answers remain concise.",
+                }
+            ],
+        )
+
+        skill_name = loop._materialize_generated_skill(
+            output,
+            action_type="create",
+            target_skill=None,
+            fallback_description="Validate derived numeric calculations.",
+        )
+
+        tests_path = tmp_path / ".claude" / "skills" / "derived-numeric-contract" / "SKILL_TESTS.json"
+        assert skill_name == "derived-numeric-contract"
+        payload = json.loads(tests_path.read_text())
+        assert payload[0]["name"] == "negative direct lookup"
+        assert payload[0]["should_activate"] is False
+
+
+class TestExecutableSkillTests:
+    def test_concrete_skill_test_query_uses_inline_task_without_expected_activation(self):
+        from src.loop.runner import SelfImprovingLoop
+
+        q = SelfImprovingLoop._skill_test_query(
+            "source-lock",
+            {
+                "name": "mini table",
+                "scenario": "Choose detailed table over summary.",
+                "source_data": "| row | detailed | summary |\n| A | 12 | 9 |",
+                "task": "Return the detailed value for A.",
+                "should_activate": True,
+                "expected_behavior": "Use detailed value.",
+                "expected_answer": "12",
+                "must_check": ["detailed"],
+                "must_reject": ["summary"],
+            },
+        )
+
+        assert "Source data:" in q
+        assert "Task:" in q
+        assert "Return the detailed value for A." in q
+        assert "Expected activation" not in q
+        assert "Potential available skill" not in q
+        assert "source-lock" not in q
+
+    def test_scores_activation_and_rubric_evidence(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        loop._project_root = __import__("pathlib").Path("/tmp/current-run")
+        spec = {
+            "name": "bind source",
+            "scenario": "Two tables share labels; one has the wrong scale.",
+            "should_activate": True,
+            "expected_behavior": "Lock table title and unit scale.",
+            "must_check": ["source_table_title", "source_unit_scale"],
+            "must_reject": ["copying the summary table"],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result=(
+                "Used source-lock contract. Checked source_table_title and "
+                "source_unit_scale; rejected copying the summary table."
+            ),
+            is_error=False,
+            output=AgentResponse(
+                final_answer=(
+                    "Checked source_table_title and source_unit_scale; rejected "
+                    "copying the summary table. Used source-lock contract."
+                ),
+                reasoning="",
+            ),
+            messages=[
+                {
+                    "type": "command_execution",
+                    "command": "sed -n '1,80p' .claude/skills/source-lock/SKILL.md",
+                    "aggregated_output": "---\nname: source-lock\n---\n",
+                }
+            ],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert result.activated is True
+        assert result.missing_checks == []
+        assert result.missing_rejections == []
+
+    def test_empty_answer_is_a_failed_self_test_not_an_exception(self):
+        from pathlib import Path
+
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        loop._project_root = Path("/tmp/current-run")
+        trace = AgentTrace(
+            duration_ms=0,
+            total_cost_usd=0.0,
+            num_turns=0,
+            usage={},
+            result="",
+            is_error=True,
+            parse_error="TimeoutError",
+            messages=[],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="numeric-check",
+            spec={
+                "name": "empty transport result",
+                "task": "Compute 2 + 2.",
+                "source_data": "2 + 2",
+                "should_activate": True,
+                "expected_behavior": "Return the sum.",
+                "expected_answer": "4",
+            },
+            trace=trace,
+        )
+
+        assert result.passed is False
+        assert "expected answer not produced" in result.reason
+
+    def test_current_project_skill_read_is_not_self_test_isolation_violation(self):
+        from pathlib import Path
+
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        loop._project_root = Path("/tmp/current-run")
+        spec = {
+            "name": "mini diff",
+            "source_data": "| row | detailed | summary |\n| A | 12 | 9 |",
+            "task": "Return the detailed value for A.",
+            "should_activate": True,
+            "expected_behavior": "Use detailed value.",
+            "expected_answer": "12",
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Using source-lock contract. 12",
+            is_error=False,
+            output=AgentResponse(final_answer="Using source-lock contract. 12", reasoning=""),
+            messages=[
+                {
+                    "type": "command_execution",
+                    "command": (
+                        "sed -n '1,80p' "
+                        "/tmp/current-run/.claude/skills/source-lock/SKILL.md"
+                    ),
+                    "aggregated_output": "---\nname: source-lock\n---\n",
+                }
+            ],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert "isolation" not in result.reason
+
+    def test_historical_tmp_skill_search_fails_self_test_isolation(self):
+        from pathlib import Path
+
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        loop._project_root = Path("/tmp/current-run")
+        spec = {
+            "name": "mini diff",
+            "source_data": "| row | detailed | summary |\n| A | 12 | 9 |",
+            "task": "Return the detailed value for A.",
+            "should_activate": True,
+            "expected_behavior": "Use detailed value.",
+            "expected_answer": "12",
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Using source-lock contract. 12",
+            is_error=False,
+            output=AgentResponse(final_answer="Using source-lock contract. 12", reasoning=""),
+            messages=[
+                {
+                    "type": "command_execution",
+                    "command": (
+                        "sed -n '1,80p' "
+                        "/tmp/evoskill-officeqa-old/.claude/skills/source-lock/SKILL.md"
+                    ),
+                    "aggregated_output": "---\nname: source-lock\n---\n",
+                }
+            ],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is False
+        assert "isolation" in result.reason
+
+    def test_fails_when_skill_over_triggers_on_negative_case(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "plain lookup",
+            "scenario": "A direct lookup with no ambiguity.",
+            "should_activate": False,
+            "expected_behavior": "Do not use the skill.",
+            "must_check": [],
+            "must_reject": [],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Used source-lock contract anyway.",
+            is_error=False,
+            output=AgentResponse(final_answer="Used source-lock contract anyway.", reasoning=""),
+            messages=[
+                {
+                    "type": "command_execution",
+                    "command": "sed -n '1,80p' .claude/skills/source-lock/SKILL.md",
+                    "aggregated_output": "---\nname: source-lock\n---\n",
+                }
+            ],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is False
+        assert result.activated is True
+        assert "activation mismatch" in result.reason
+
+    def test_scores_concrete_task_by_expected_answer(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "mini diff",
+            "scenario": "Detailed table beats summary.",
+            "source_data": "| row | detailed | summary |\n| A | 12 | 9 |",
+            "task": "Return the detailed value for A.",
+            "should_activate": True,
+            "expected_behavior": "Use detailed value.",
+            "expected_answer": "12",
+            "forbidden_outputs": ["9"],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Used source-lock contract. 12",
+            is_error=False,
+            output=AgentResponse(final_answer="Used source-lock contract. 12", reasoning=""),
+            messages=[
+                {
+                    "type": "command_execution",
+                    "command": "sed -n '1,80p' .claude/skills/source-lock/SKILL.md",
+                    "aggregated_output": "---\nname: source-lock\n---\n",
+                }
+            ],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+
+    def test_concrete_positive_passes_when_problem_solved_without_reported_activation(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "mini diff",
+            "scenario": "Detailed table beats summary.",
+            "source_data": "| row | detailed | summary |\n| A | 12 | 9 |",
+            "task": "Return the detailed value for A.",
+            "should_activate": True,
+            "expected_behavior": "Use detailed value.",
+            "expected_answer": "12",
+            "must_check": ["detailed source"],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="The detailed value for A is 12.",
+            is_error=False,
+            output=AgentResponse(final_answer="12", reasoning=""),
+            messages=[],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert result.activated is False
+        assert "primary signal" in result.reason
+
+    def test_concrete_negative_does_not_require_rubric_recitation(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "plain sum",
+            "scenario": "Explicit same-unit arithmetic.",
+            "source_data": "",
+            "task": "Compute 47 + 19.",
+            "should_activate": False,
+            "expected_behavior": "Answer directly.",
+            "expected_answer": "66",
+            "must_check": ["no ledger"],
+            "must_reject": ["source binding"],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="66",
+            is_error=False,
+            output=AgentResponse(final_answer="66", reasoning=""),
+            messages=[],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert result.activated is False
+        assert result.missing_checks == ["no ledger"]
+
+    def test_concrete_negative_overtrigger_is_diagnostic_when_answer_is_correct(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "plain sum",
+            "scenario": "Explicit same-unit arithmetic.",
+            "task": "Compute 47 + 19.",
+            "should_activate": False,
+            "expected_behavior": "Answer directly.",
+            "expected_answer": "66",
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Used source-lock contract. 47 + 19 = 66.",
+            is_error=False,
+            output=AgentResponse(final_answer="66", reasoning=""),
+            messages=[],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert result.activated is True
+        assert "diagnostic over-trigger" in result.reason
+
+    def test_concrete_positive_missing_rubric_is_diagnostic_only(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "span sum",
+            "scenario": "Inclusive span sum.",
+            "source_data": "| Week | North |\n| W1 | 10 |\n| W2 | 12 |\n| W3 | 15 |\n| W4 | 9 |",
+            "task": "What is the total North value for W2 through W4?",
+            "should_activate": True,
+            "expected_behavior": "Sum W2-W4.",
+            "expected_answer": "36",
+            "must_check": ["explicitly says exclude W1"],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Used source-lock contract. 12 + 15 + 9 = 36.",
+            is_error=False,
+            output=AgentResponse(
+                final_answer="Used source-lock contract. 12 + 15 + 9 = 36.",
+                reasoning="",
+            ),
+            messages=[],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert result.missing_checks == ["explicitly says exclude W1"]
+
+    def test_forbidden_outputs_only_check_final_answer_exactly(self):
+        from src.harness.agent import AgentTrace
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+        from src.schemas import AgentResponse
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        spec = {
+            "name": "unit conversion",
+            "scenario": "Convert then round.",
+            "source_data": "A = 845 g",
+            "task": "Convert A to kg, rounded to 2 decimals.",
+            "should_activate": True,
+            "expected_behavior": "Round at end.",
+            "expected_answer": "0.85 kg",
+            "forbidden_outputs": ["0.845 kg"],
+        }
+        trace = AgentTrace(
+            duration_ms=1,
+            total_cost_usd=0.0,
+            num_turns=1,
+            usage={},
+            result="Used source-lock contract. 845 g = 0.845 kg, rounded to 0.85 kg.",
+            is_error=False,
+            output=AgentResponse(
+                final_answer="0.85 kg",
+                reasoning="845 g = 0.845 kg before rounding.",
+            ),
+            messages=[],
+        )
+
+        result = loop._score_executable_skill_test(
+            skill_name="source-lock",
+            spec=spec,
+            trace=trace,
+        )
+
+        assert result.passed is True
+        assert result.missing_rejections == []
+
+
 class TestPickLeastShown:
     @staticmethod
     def _loop():
@@ -746,6 +1380,97 @@ class TestPickLeastShown:
         loop = self._loop()
         assert loop._pick_least_shown([], 2) == []
         assert loop._pick_least_shown([self._fail("q0")], 0) == []
+
+
+class TestSampleProposalFailuresBandit:
+    """Phase 3 port: _sample_proposal_failures records bandit keys and biases by gain."""
+
+    @staticmethod
+    def _loop(failure_selection="bandit", categories=("a", "b")):
+        from src.loop.runner import SelfImprovingLoop
+        from src.loop.config import LoopConfig
+        from src.loop.curriculum import CategoryBandit
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig(
+            failure_selection=failure_selection,
+            categories_per_batch=1,
+            samples_per_category=1,
+        )
+        loop._failure_shown_count = {}
+        loop._category_offset = 0
+        loop._last_bandit_keys = []
+        loop._bandit = CategoryBandit(list(categories), epsilon=0.05, ema=1.0)
+        return loop
+
+    @staticmethod
+    def _fail(qid, cat):
+        # 6-tuple: (_, question, _, _, category, failure_type="")
+        return (None, qid, "", "", cat, "")
+
+    def test_records_sampled_category_keys(self):
+        loop = self._loop()
+        pool = [self._fail("qa", "a"), self._fail("qb", "b")]
+        loop._sample_proposal_failures(pool, ["a", "b"], failure_types=[])
+        assert loop._last_bandit_keys  # populated
+        assert set(loop._last_bandit_keys) <= {"a", "b"}
+
+    def test_bandit_biases_toward_high_gain_category(self):
+        loop = self._loop()
+        # Make both categories "seen", then reward "a" strongly.
+        loop._bandit.update("a", accepted=True, score_delta=0.9)
+        loop._bandit.update("b", accepted=False, score_delta=0.0)
+        pool = [self._fail("qa", "a"), self._fail("qb", "b")]
+        picks = {"a": 0, "b": 0}
+        for _ in range(200):
+            loop._sample_proposal_failures(pool, ["a", "b"], failure_types=[])
+            for k in loop._last_bandit_keys:
+                picks[k] += 1
+        assert picks["a"] > picks["b"] * 2
+
+    def test_round_robin_mode_still_records_keys(self):
+        loop = self._loop(failure_selection="round_robin")
+        pool = [self._fail("qa", "a"), self._fail("qb", "b")]
+        loop._sample_proposal_failures(pool, ["a", "b"], failure_types=[])
+        assert loop._last_bandit_keys == ["a"]  # deterministic first category
+
+
+class TestSampleInductionSuccesses:
+    """Skill-induction sampling: prefer hard categories, rotate across calls."""
+
+    @staticmethod
+    def _loop(prefer_hard=True):
+        from src.loop.runner import SelfImprovingLoop
+        from src.loop.config import LoopConfig
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig(success_induction_prefer_hard=prefer_hard)
+        loop._induction_offset = 0
+        return loop
+
+    @staticmethod
+    def _succ(qid, cat):
+        # 7-tuple: (trace, question, answer, gt, category, ftype, feedback)
+        return (None, qid, "ans", "gt", cat, "regression_pass", "fb")
+
+    def test_prefers_hard_category_success(self):
+        loop = self._loop(prefer_hard=True)
+        successes = [self._succ("se", "easy"), self._succ("sh", "hard")]
+        # "hard" has many failures, "easy" has none -> a hard success is rarer/valuable.
+        failures = [(None, f"f{i}", "", "", "hard", "") for i in range(5)]
+        picked = loop._sample_induction_successes(successes, failures, count=1)
+        assert [p[1] for p in picked] == ["sh"]
+
+    def test_empty_when_no_successes(self):
+        loop = self._loop()
+        assert loop._sample_induction_successes([], [], count=2) == []
+
+    def test_rotation_advances_offset(self):
+        loop = self._loop(prefer_hard=False)
+        successes = [self._succ("s0", "c"), self._succ("s1", "c"), self._succ("s2", "c")]
+        first = loop._sample_induction_successes(successes, [], count=1)
+        second = loop._sample_induction_successes(successes, [], count=1)
+        assert first[0][1] != second[0][1]  # rotation picks a different success
 
 
 class TestSelectBtAnchors:
@@ -829,6 +1554,7 @@ class TestJudgeAndRevisionQueries:
         q = build_judge_query(
             "trace", "question?", "wrong", "expected",
             proposer_root_cause="agent read the wrong row",
+            candidate_skill_tests='[{"name":"synthetic regression","should_activate":false}]',
         )
         assert "agent read the wrong row" in q
         assert "proposer_root_cause_correct" in q
@@ -837,7 +1563,11 @@ class TestJudgeAndRevisionQueries:
         assert "executable_specificity" in q
         assert "high_risk_blacklist" in q
         assert "generalization_transfer" in q
+        assert "Candidate-Generated Skill Tests" in q
+        assert "self_test_pass_rate" in q
+        assert "synthetic regression" in q
         assert "polished but generic skill text" in q
+        assert "EXECUTABLE_SKILL_TEST_RESULTS" in q
 
     def test_build_judge_query_omits_section_when_no_root_cause(self):
         from src.loop.helpers import build_judge_query
@@ -855,6 +1585,7 @@ class TestJudgeAndRevisionQueries:
                 "executable_specificity": 0.0,
                 "high_risk_blacklist": 0.0,
                 "generalization_transfer": 0.0,
+                "self_test_pass_rate": 0.0,
             }
         )
         assert generic_quality == pytest.approx(0.0)
@@ -866,6 +1597,7 @@ class TestJudgeAndRevisionQueries:
                 "executable_specificity": 1.0,
                 "high_risk_blacklist": 1.0,
                 "generalization_transfer": 1.0,
+                "self_test_pass_rate": 1.0,
             }
         )
         assert concrete_quality == pytest.approx(1.0)
@@ -1028,3 +1760,388 @@ class TestJudgePromptNoDrawLean:
         assert "Score above 0.5 only" not in q
         assert "decisive" in q
         assert "0.5 ONLY when" in q
+
+    def test_compact_prompt_explicitly_labels_candidate_slot(self):
+        from src.loop.helpers import build_compact_judge_query
+
+        q = build_compact_judge_query(
+            "trace",
+            "question",
+            "wrong",
+            "expected",
+            parent_skill_summary="candidate summary in A",
+            candidate_skill_summary="parent summary in B",
+            skill_diff="+ candidate change",
+            candidate_slot="A",
+        )
+
+        assert "CANDIDATE containing the Change Being Evaluated is Skill Set A" in q
+        assert "unchanged PARENT is Skill Set B" in q
+        assert "Present in Skill Set A; absent from Skill Set B" in q
+
+
+class TestPromptCompaction:
+    def test_compact_relevant_text_keeps_matching_lines(self):
+        from src.loop.helpers import compact_relevant_text
+
+        text = "\n".join(
+            ["unrelated filler " + str(i) for i in range(60)]
+            + [
+                "Tool call selected wrong artifact scope=v2",
+                "Computed result from wrong artifact",
+            ]
+            + ["more unrelated filler " + str(i) for i in range(60)]
+        )
+
+        compacted = compact_relevant_text(
+            text,
+            "artifact scope wrong",
+            max_chars=500,
+            context_lines=0,
+        )
+
+        assert "wrong artifact" in compacted
+        assert len(compacted) <= 650
+
+
+class TestGenericEvolutionPrompts:
+    def test_global_prompts_do_not_assume_officeqa_or_table_numeric_tasks(self):
+        from src.agent_profiles.base_agent.prompt import BASE_AGENT_SYSTEM_PROMPT
+        from src.agent_profiles.skill_generator.prompt import SKILL_GENERATOR_SYSTEM_PROMPT
+        from src.agent_profiles.skill_proposer.prompt import SKILL_PROPOSER_SYSTEM_PROMPT
+        from src.agent_profiles.skill_verifier.prompt import SKILL_VERIFIER_SYSTEM_PROMPT
+        from src.loop.helpers import build_judge_query, build_proposer_query
+
+        prompts = [
+            BASE_AGENT_SYSTEM_PROMPT,
+            SKILL_PROPOSER_SYSTEM_PROMPT,
+            SKILL_GENERATOR_SYSTEM_PROMPT,
+            SKILL_VERIFIER_SYSTEM_PROMPT,
+            build_proposer_query([], "none"),
+            build_judge_query("trace", "task", "wrong", "expected"),
+        ]
+        combined = "\n".join(prompts).lower()
+
+        for forbidden in (
+            "officeqa",
+            "treasury",
+            "top office firm",
+            "source/table",
+            "row/column",
+            "same-unit",
+            "rollup",
+            "subcategory",
+            "percentage-point",
+            "numeric-workflow",
+        ):
+            assert forbidden not in combined
+
+        for required in ("artifact", "tool", "state", "output contract"):
+            assert required in combined
+
+
+# ===========================================================================
+# Scoring-accuracy + skill-completeness guards
+# ===========================================================================
+
+class TestScoringAndCompletenessConfig:
+    def test_new_guard_defaults(self):
+        from src.loop.config import LoopConfig
+
+        c = LoopConfig()
+        assert c.judge_max_output_tokens == 1536
+        assert c.judge_regression_penalty_weight == 1.5
+        assert c.judge_regression_sample_multiplier == 2.0
+        assert c.discard_on_negative_self_test_failure is False
+        assert c.puct_overlap_prior_penalty == 0.6
+        assert c.puct_overlap_similarity_threshold == 0.35
+        assert c.distill_frontier_at_end is True
+        assert c.frontier_distill_top_k == 4
+        assert c.skill_edit_min_retention_ratio == 0.5
+        assert c.enforce_skill_sections is True
+        assert c.max_active_skills == 8
+        assert "Invariants" in c.required_skill_sections
+
+
+class TestSkillSectionHelpers:
+    def test_section_headers_lowercased(self):
+        from src.loop.runner import SelfImprovingLoop
+
+        md = "# When To Use\nx\n## Procedure\ny\n### Invariants\nz"
+        assert SelfImprovingLoop._section_headers(md) == {
+            "when to use",
+            "procedure",
+            "invariants",
+        }
+
+    def test_missing_required_sections(self):
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig()
+        md = "## When To Use\na\n## Procedure\nb"
+        missing = loop._missing_required_sections(md)
+        assert "When To Use" not in missing
+        assert "Procedure" not in missing
+        assert "Invariants" in missing
+        assert "Regression Risks" in missing
+
+    def test_missing_required_sections_disabled_when_empty(self):
+        from src.loop.runner import SelfImprovingLoop
+        import types
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = types.SimpleNamespace(required_skill_sections=())
+        assert loop._missing_required_sections("## Anything") == []
+
+
+class TestMisleadingWorkedExampleGeneralized:
+    def test_flags_grid_size_scaffold(self):
+        from src.loop.runner import SelfImprovingLoop
+
+        md = "grid_size: 5 x 4 = 20\nfinal_answer: 20"
+        assert SelfImprovingLoop._has_misleading_worked_example(md) is True
+
+    def test_distinct_answer_still_clean(self):
+        from src.loop.runner import SelfImprovingLoop
+
+        md = (
+            "ledger_count_check: expected 7 categories * 2 periods = 14 threshold tests\n"
+            "Answer: 3 categories\n"
+        )
+        assert SelfImprovingLoop._has_misleading_worked_example(md) is False
+
+
+class TestProposerSkillBudget:
+    def test_budget_reached_forces_edit(self, tmp_path):
+        from src.loop.helpers import build_proposer_query
+
+        skills = tmp_path / ".claude" / "skills"
+        for name in ("a", "b"):
+            (skills / name).mkdir(parents=True)
+            (skills / name / "SKILL.md").write_text("---\nname: %s\n---\n" % name)
+
+        q = build_proposer_query(
+            [], "none", project_root=tmp_path, max_active_skills=2
+        )
+        assert "active-skill budget is reached" in q
+        assert 'action="edit"' in q
+
+    def test_budget_not_reached_allows_create(self, tmp_path):
+        from src.loop.helpers import build_proposer_query
+
+        skills = tmp_path / ".claude" / "skills"
+        (skills / "a").mkdir(parents=True)
+        (skills / "a" / "SKILL.md").write_text("---\nname: a\n---\n")
+
+        q = build_proposer_query(
+            [], "none", project_root=tmp_path, max_active_skills=8
+        )
+        assert "active-skill budget is reached" not in q
+
+
+class TestRevisionCompletenessDirectives:
+    def test_structural_and_self_test_gaps_appended(self):
+        from src.loop.helpers import build_skill_revision_query
+
+        q = build_skill_revision_query(
+            target_skill="s",
+            current_skill_markdown="md",
+            proposer_root_cause="rc",
+            original_proposal="prop",
+            judge_root_cause="jrc",
+            judge_blockers=["b"],
+            structural_gaps=["Invariants", "Procedure"],
+            self_test_gap=True,
+        )
+        assert "Completeness Corrections" in q
+        assert "Invariants, Procedure" in q
+        assert "negative (should_activate=false)" in q
+
+    def test_executable_self_test_feedback_appended(self):
+        from src.loop.helpers import build_skill_revision_query
+
+        q = build_skill_revision_query(
+            target_skill="s",
+            current_skill_markdown="md",
+            proposer_root_cause="rc",
+            original_proposal="prop",
+            judge_root_cause="jrc",
+            judge_blockers=["b"],
+            executable_self_test_feedback=(
+                "actual_pass_rate: 0.400 (2/5)\n"
+                "- FAIL s/negative-boundary: should_activate=False, activated=True"
+            ),
+        )
+        assert "Executable Self-Test Feedback" in q
+        assert "actual_pass_rate: 0.400" in q
+        assert "should_activate=False, activated=True" in q
+
+    def test_no_directives_when_complete(self):
+        from src.loop.helpers import build_skill_revision_query
+
+        q = build_skill_revision_query(
+            target_skill="s",
+            current_skill_markdown="md",
+            proposer_root_cause="rc",
+            original_proposal="prop",
+            judge_root_cause="jrc",
+            judge_blockers=["b"],
+            structural_gaps=[],
+            self_test_gap=False,
+        )
+        assert "Completeness Corrections" not in q
+
+
+class TestExecutableSelfTestRevisionFeedback:
+    def test_failed_negative_self_test_is_detected(self):
+        from src.loop.runner import (
+            ExecutableSkillTestCaseResult,
+            ExecutableSkillTestSuiteResult,
+            SelfImprovingLoop,
+        )
+
+        result = ExecutableSkillTestSuiteResult(
+            passed=1,
+            total=2,
+            pass_rate=0.5,
+            cases=[
+                ExecutableSkillTestCaseResult(
+                    skill_name="s",
+                    test_name="positive",
+                    should_activate=True,
+                    activated=True,
+                    passed=True,
+                    reason="ok",
+                ),
+                ExecutableSkillTestCaseResult(
+                    skill_name="s",
+                    test_name="negative",
+                    should_activate=False,
+                    activated=True,
+                    passed=False,
+                    reason="over-triggered",
+                ),
+            ],
+        )
+
+        assert SelfImprovingLoop._has_failed_negative_self_test(result) is True
+        assert SelfImprovingLoop._has_failed_negative_self_test(None) is False
+
+    def test_passed_negative_overtrigger_is_not_a_hard_failure(self):
+        from src.loop.runner import (
+            ExecutableSkillTestCaseResult,
+            ExecutableSkillTestSuiteResult,
+            SelfImprovingLoop,
+        )
+
+        result = ExecutableSkillTestSuiteResult(
+            passed=1,
+            total=1,
+            pass_rate=1.0,
+            cases=[
+                ExecutableSkillTestCaseResult(
+                    skill_name="s",
+                    test_name="negative-correct-answer",
+                    should_activate=False,
+                    activated=True,
+                    passed=True,
+                    reason="concrete task solved; diagnostic over-trigger",
+                ),
+            ],
+        )
+
+        assert SelfImprovingLoop._has_failed_negative_self_test(result) is False
+
+    def test_compacts_failures_for_revision_prompt(self):
+        from src.loop.runner import (
+            ExecutableSkillTestCaseResult,
+            ExecutableSkillTestSuiteResult,
+            SelfImprovingLoop,
+        )
+
+        result = ExecutableSkillTestSuiteResult(
+            passed=1,
+            total=2,
+            pass_rate=0.5,
+            cases=[
+                ExecutableSkillTestCaseResult(
+                    skill_name="s",
+                    test_name="positive",
+                    should_activate=True,
+                    activated=True,
+                    passed=True,
+                    reason="ok",
+                ),
+                ExecutableSkillTestCaseResult(
+                    skill_name="s",
+                    test_name="negative",
+                    should_activate=False,
+                    activated=True,
+                    passed=False,
+                    reason="activated on direct lookup",
+                    missing_checks=["direct lookup boundary"],
+                    missing_rejections=["do not build ledger"],
+                    agent_answer="built a long protocol block anyway",
+                ),
+            ],
+        )
+
+        text = SelfImprovingLoop._self_test_revision_feedback(result)
+        assert "actual_pass_rate: 0.500 (1/2)" in text
+        assert "- FAIL s/negative" in text
+        assert "should_activate=False, activated=True" in text
+        assert "missing_checks: direct lookup boundary" in text
+        assert "missing_rejections: do not build ledger" in text
+        assert "agent_answer: built a long protocol block anyway" in text
+
+
+class TestPuctProposalDiversity:
+    def test_existing_children_advance_diversity_strategy_across_iterations(self):
+        from src.loop.runner import ProgramSearchNode, SelfImprovingLoop
+
+        parent = ProgramSearchNode("base", None)
+        prior_child = ProgramSearchNode(
+            "iter-skill-1",
+            parent,
+            proposal="Edit source binding gate",
+            proposal_action="edit",
+            proposal_skill="source-binding-gate",
+        )
+
+        hint = SelfImprovingLoop._build_child_diversity_hint(
+            0,
+            [],
+            existing_children=[prior_child],
+        )
+
+        assert "alternative root-cause hypothesis" in hint
+        assert "Earlier child actions: edit" in hint
+        assert "source-binding-gate" in hint
+
+    def test_overlapping_proposal_gets_lower_prior(self):
+        from src.loop.config import LoopConfig
+        from src.loop.runner import SelfImprovingLoop
+
+        loop = object.__new__(SelfImprovingLoop)
+        loop.config = LoopConfig(
+            puct_overlap_similarity_threshold=0.1,
+            puct_overlap_prior_penalty=0.8,
+        )
+        proposal = "Bind the exact source table row and column before arithmetic."
+        unrelated = "Choose a browser download directory for generated reports."
+
+        overlapping = loop._proposal_policy_prior(
+            0.8,
+            proposal=proposal,
+            existing_skill_content=proposal,
+        )
+        distinct = loop._proposal_policy_prior(
+            0.8,
+            proposal=proposal,
+            existing_skill_content=unrelated,
+        )
+
+        assert overlapping < distinct
+        assert distinct == pytest.approx(0.8)

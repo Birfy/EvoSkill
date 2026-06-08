@@ -33,23 +33,44 @@ def _make_openai_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Convert a Pydantic JSON schema to OpenAI strict structured output format.
 
     OpenAI's Responses API requires:
-        - "additionalProperties": false at the top level
-        - "required" must list ALL property keys (no optional fields)
+        - "additionalProperties": false on every object node
+        - "required" must list ALL property keys on every object node
 
     Pydantic's model_json_schema() only puts truly required fields in "required",
     but OpenAI demands every property is listed. Fields with defaults still work
     because the model will always produce them.
     """
-    strict = {**schema, "additionalProperties": False}
-    if "properties" in strict:
-        strict["required"] = list(strict["properties"].keys())
+    if not isinstance(schema, dict):
+        return schema
+
+    strict: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):
+            strict[key] = {
+                item_key: _make_openai_strict_schema(item_value)
+                for item_key, item_value in value.items()
+            }
+        elif key in {"items", "additionalProperties"} and isinstance(value, dict):
+            strict[key] = _make_openai_strict_schema(value)
+        elif key in {"anyOf", "oneOf", "allOf"} and isinstance(value, list):
+            strict[key] = [
+                _make_openai_strict_schema(item) if isinstance(item, dict) else item
+                for item in value
+            ]
+        else:
+            strict[key] = value
+
+    if strict.get("type") == "object" or "properties" in strict:
+        strict["additionalProperties"] = False
+        if isinstance(strict.get("properties"), dict):
+            strict["required"] = list(strict["properties"].keys())
     return strict
 
 
 def build_codex_options(
     *,
     system: str,
-    schema: dict[str, Any],
+    schema: dict[str, Any] | None,
     tools: Iterable[str],
     project_root: str | Path | None = None,
     model: str | None = None,
@@ -64,7 +85,9 @@ def build_codex_options(
 
     Args:
         system: System prompt text (from the agent profile's prompt.txt or task.md)
-        schema: JSON schema dict for structured output (from Pydantic model_json_schema())
+        schema: JSON schema dict for structured output, or None to omit output_schema.
+                Pass None for file-writing agents (skill generator) so the model
+                can freely use file tools without being constrained to JSON output.
         tools: Tool names from the agent profile (e.g., ["Read", "Write", "Bash"]).
                Stored as metadata only — Codex has its own built-in tools.
         project_root: Path to the project root. Resolved automatically if None.
@@ -75,7 +98,8 @@ def build_codex_options(
                    so the agent knows where to look.
 
     Returns:
-        Dict with keys: system, output_schema, model, working_directory, tools, data_dirs.
+        Dict with keys: system, model, working_directory, tools, data_dirs, and
+        optionally output_schema (omitted when schema is None).
         This dict is passed to execute_query() in executor.py.
     """
     root = resolve_project_root(project_root)
@@ -93,17 +117,9 @@ def build_codex_options(
             f"{dirs_note}"
         )
 
-    return {
+    result: dict[str, Any] = {
         # The system prompt — sent to the Codex thread
         "system": system_with_dirs,
-
-        # JSON schema for structured output — passed to thread.run() as output_schema.
-        # Unlike OpenCode which wraps it in {"type": "json_schema", "schema": ...},
-        # Codex takes the raw schema dict directly.
-        # OpenAI's Responses API requires:
-        #   - "additionalProperties": false
-        #   - "required" must list ALL property keys (no optional fields allowed)
-        "output_schema": _make_openai_strict_schema(schema),
 
         # Model name — passed to Codex thread configuration
         "model": model or DEFAULT_CODEX_MODEL,
@@ -119,3 +135,11 @@ def build_codex_options(
         # Resolved absolute paths to extra data directories
         "data_dirs": resolved_data_dirs,
     }
+
+    # Only include output_schema when a schema is provided. Omitting it lets
+    # the Codex agent use file tools freely (needed for the skill generator,
+    # which must write SKILL.md files rather than just produce JSON output).
+    if schema is not None:
+        result["output_schema"] = _make_openai_strict_schema(schema)
+
+    return result

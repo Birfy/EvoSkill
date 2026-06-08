@@ -291,6 +291,10 @@ def test_mutate_switches_to_parent_before_reading_program_config(tmp_path: Path)
             SkillProposerResponse(
                 proposed_skill="Create a test skill.",
                 justification="It covers the missing behavior.",
+                should_apply_when="Use when the task shows the missing behavior.",
+                should_not_apply_when="Do not use when the behavior is already covered.",
+                invariants_to_preserve="Preserve existing correct source, formula, unit, and output behavior.",
+                regression_risks="Could over-apply to unrelated tasks.",
             )
         ),
         prompt_proposer=DummyAgent(

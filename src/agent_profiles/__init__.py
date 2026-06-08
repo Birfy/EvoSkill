@@ -4,7 +4,6 @@ Each subdirectory defines a specific agent role (system prompt, tools, schema).
 Harness/SDK logic lives in src.harness, not here.
 """
 
-from .proposer import proposer_options
 from .skill_generator import skill_generator_options, make_skill_generator_options
 from .base_agent import base_agent_options, make_base_agent_options
 from .dabstep_agent import dabstep_agent_options, make_dabstep_agent_options
@@ -15,10 +14,10 @@ from .livecodebench_agent import (
 )
 from .prompt_generator import prompt_generator_options, make_prompt_generator_options
 from .skill_proposer import skill_proposer_options, make_skill_proposer_options
+from .skill_verifier import skill_verifier_options, make_skill_verifier_options
 from .prompt_proposer import prompt_proposer_options, make_prompt_proposer_options
 
 __all__ = [
-    "proposer_options",
     "skill_generator_options",
     "base_agent_options",
     "make_base_agent_options",
@@ -32,6 +31,8 @@ __all__ = [
     "make_prompt_generator_options",
     "skill_proposer_options",
     "make_skill_proposer_options",
+    "skill_verifier_options",
+    "make_skill_verifier_options",
     "prompt_proposer_options",
     "make_prompt_proposer_options",
     "make_skill_generator_options",

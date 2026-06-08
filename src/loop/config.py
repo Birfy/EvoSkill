@@ -19,7 +19,10 @@ class LoopConfig:
     Attributes:
         max_iterations: Maximum number of improvement iterations.
         frontier_size: Number of top-performing programs to keep.
-        no_improvement_limit: Stop early after this many iterations without improvement.
+        no_improvement_limit: Stop early after this many iterations without
+            improvement. Set to 0 or None to disable early stopping and run the
+            full max_iterations budget (recommended for budget-based PUCT runs
+            where the best score plateaus while the tree is still exploring).
         tolerance: Tolerance for answer matching (0.0 = exact match).
         concurrency: Number of concurrent evaluations.
         evolution_mode: Which dimension to evolve ("prompt_only" or "skill_only").
@@ -33,7 +36,7 @@ class LoopConfig:
 
     max_iterations: int = 5
     frontier_size: int = 3
-    no_improvement_limit: int = 5
+    no_improvement_limit: int | None = 5
     tolerance: float = 0.0
     concurrency: int = 4
 
@@ -133,6 +136,13 @@ class LoopConfig:
     # amplified by this factor before it enters the average / Bradley-Terry match.
     # 1.0 keeps the old symmetric behavior.
     judge_regression_penalty_weight: float = 1.5
+    # Number of previously-correct trajectories judged per proposal failure.
+    # Regression cases are the only offline signal for whether a broadly
+    # applicable skill will disturb behavior that already works.
+    judge_regression_sample_multiplier: float = 2.0
+    # A verifier-authored negative self-test is specifically designed to catch
+    # over-triggering. If one fails, do not allow the child into the frontier.
+    discard_on_negative_self_test_failure: bool = False
     judge_log_details: bool = True
     # Hold out a fraction of failures (per category) so the judge scores
     # candidates ONLY on cases the proposer never saw. This prevents the
@@ -150,6 +160,10 @@ class LoopConfig:
     puct_children_per_node: int = 2
     children_per_iteration: int = 2
     puct_default_prior: float = 0.5
+    # Penalize proposal priors when their mechanism text substantially overlaps
+    # an existing active skill or an already-generated sibling proposal.
+    puct_overlap_prior_penalty: float = 0.6
+    puct_overlap_similarity_threshold: float = 0.35
 
     # judge→generator refine loop. After the judge scores a child, if the
     # candidate is judged NOT to address the failure's root cause (mean
@@ -252,8 +266,9 @@ class LoopConfig:
     # (accept_rate * mean_score_delta from feedback outcomes), so effort
     # concentrates on categories where proposals actually move the score and
     # away from ones that never improve. Falls back to round-robin until each
-    # category has been tried at least once.
-    failure_selection: FailureSelection = "round_robin"
+    # category has been tried at least once. Default-on; wired into both the
+    # standard loop and the LLM-judge/PUCT loop (over failure_type or category).
+    failure_selection: FailureSelection = "bandit"
     # Exploration floor for the bandit's softmax sampling (epsilon). Keeps
     # every category reachable even after it accrues a low value.
     failure_bandit_epsilon: float = 0.15
@@ -265,7 +280,9 @@ class LoopConfig:
     # bullets, each carrying helpful/harmful counters. Proposals are applied as
     # small deterministic deltas (add/reinforce/retire) rather than monolithic
     # rewrites, and bullets that the held-out gate finds harmful are pruned.
-    use_playbook: bool = False
+    # Default-on; counters are credited in both the standard loop and the
+    # LLM-judge/PUCT loop when a child improves over its parent.
+    use_playbook: bool = True
     # Max bullets kept per skill playbook before lazy pruning (drops bullets
     # with harmful > helpful first, then least-helpful).
     playbook_max_bullets: int = 12
@@ -273,10 +290,70 @@ class LoopConfig:
     # reinforcement of an existing one (dedup) instead of a new entry.
     playbook_dedup_threshold: float = 0.85
 
+    # --- Information-isolated skill verifier (CoEvoSkills) -----------------
+    # When on (and a skill_verifier agent is provided), a SEPARATE agent authors
+    # each candidate skill's test cases — without seeing ground-truth answers and
+    # isolated from the skill author — so the self-test signal cannot be gamed by
+    # whoever wrote the skill (which is the weakness behind weak_self_test_coverage).
+    # The verifier's tests overwrite the generator's SKILL_TESTS.json and feed the
+    # existing self_test_pass_rate path (executed if executable_skill_tests is on,
+    # otherwise estimated by the judge from the test content — no new agent rollout).
+    use_skill_verifier: bool = True
+    # Lower cap = fewer verifier output tokens per skill. 4 still leaves room for
+    # an activation, an over-trigger negative, and a procedure-fidelity case.
+    skill_verifier_max_tests: int = 4
+
+    # --- Multi-skill proposals (token/latency control) --------------------
+    # When False (default), a proposal applies only its primary skill edit even if
+    # the proposer returned extra `skill_edits` — this avoids the extra generator
+    # (and verifier) calls per additional skill. Turn on to let one proposal create
+    # or edit several skills at once.
+    enable_multi_skill: bool = False
+
+    # --- Final frontier distillation --------------------------------------
+    # After search, synthesize one compact skill from the strongest frontier
+    # programs. The distilled child is returned only if executable self-tests
+    # pass and the judge finds it non-regressive versus the frontier champion.
+    distill_frontier_at_end: bool = True
+    frontier_distill_top_k: int = 4
+    frontier_distill_judge_failures: int = 4
+    frontier_distill_judge_regressions: int = 4
+
+    # --- Epoch-wise slow/meta update (SkillOpt) ---------------------------
+    # Every meta_update_period iterations the LLM-judge loop consolidates the
+    # accumulated per-child outcomes into a compact, PROTECTED meta summary
+    # (improvements / regressions / persistent unresolved blockers / what worked),
+    # written to .evoskill/meta.md and prepended to the proposer's context. The
+    # consolidation is deterministic (no LLM call) so it cannot suffer the
+    # "context collapse" of repeated monolithic rewrites; step-level feedback can
+    # never overwrite it. Gives the proposer longitudinal memory: stop re-trying
+    # fixes that never resolved a blocker, and build on skills that worked.
+    meta_update_enabled: bool = True
+    meta_update_period: int = 5
+    # Cap how many persistent blockers / winning skills the meta lists.
+    meta_top_k: int = 5
+
+    # --- Skill induction from successful trajectories ---------------------
+    # Besides fixing failures, mine successful trajectories to distill the
+    # reusable procedure/decision that made them work into a new or edited skill.
+    # Induced skills still pass through the same judge gate, so only ones that
+    # actually help survive. Wired into the LLM-judge/PUCT loop. Default-on.
+    induce_skills_from_success: bool = True
+    # Long-run fraction of generated children drawn from success induction (the
+    # rest from failure analysis). 0.25 ≈ 3 failure : 1 success. A fractional
+    # accumulator schedules induction children so the ratio holds even when only
+    # 1-2 children are generated per iteration.
+    success_induction_ratio: float = 0.25
+    # Prefer successes in hard categories (high failure share) — a success on a
+    # mostly-failing category is the most valuable to generalize into a skill.
+    success_induction_prefer_hard: bool = True
+
     # --- Phase 2: quality-diversity / Pareto frontier ---------------------
-    # "scalar" (default) keeps the top-k-by-average frontier. "qd" keeps one
+    # "scalar" keeps the top-k-by-average frontier. "qd" (default) keeps one
     # elite per failure-category niche (MAP-Elites-lite) plus a global best, so
     # programs that specialize on a single category survive instead of being
     # crowded out by the average-best program — preserving diversity for the
-    # PUCT/parent search and complementary-skill merges.
-    frontier_mode: FrontierMode = "scalar"
+    # PUCT/parent search and complementary-skill merges. In the LLM-judge loop
+    # QD applies to non-Bradley-Terry scoring (BT manages the frontier via its
+    # league refit); the niche vector comes from the judge's per-category matches.
+    frontier_mode: FrontierMode = "qd"

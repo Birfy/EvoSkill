@@ -134,6 +134,44 @@ def test_apply_delta_prune_drops_credited_id(tmp_path):
     assert added == []  # the new (helpful:0) bullet loses pruning and is not credited
 
 
+def test_credit_playbook_bumps_every_applied_skill(tmp_path):
+    from src.loop.runner import SelfImprovingLoop, MutationResult
+
+    # Two skills, each with a fresh bullet to credit.
+    _write_skill(tmp_path, "skA", "# A\n")
+    _write_skill(tmp_path, "skB", "# B\n")
+    ba = apply_playbook_delta(tmp_path, "skA", [{"op": "add", "text": "rule a"}])
+    bb = apply_playbook_delta(tmp_path, "skB", [{"op": "add", "text": "rule b"}])
+
+    loop = object.__new__(SelfImprovingLoop)
+    loop._project_root = tmp_path
+    mr = MutationResult(
+        child_name="c", proposal="p", justification="j", proposer_confidence=0.5,
+        applied_skills=[
+            {"skill_name": "skA", "credited_bullets": ba},
+            {"skill_name": "skB", "credited_bullets": bb},
+        ],
+    )
+    total = loop._credit_playbook(mr)
+    assert total == 2
+    assert parse_playbook((tmp_path / ".claude/skills/skA/SKILL.md").read_text()).by_id(ba[0]).helpful == 1
+    assert parse_playbook((tmp_path / ".claude/skills/skB/SKILL.md").read_text()).by_id(bb[0]).helpful == 1
+
+
+def test_credit_playbook_falls_back_to_singular_fields(tmp_path):
+    from src.loop.runner import SelfImprovingLoop, MutationResult
+
+    _write_skill(tmp_path, "solo", "# Solo\n")
+    bullets = apply_playbook_delta(tmp_path, "solo", [{"op": "add", "text": "x"}])
+    loop = object.__new__(SelfImprovingLoop)
+    loop._project_root = tmp_path
+    mr = MutationResult(
+        child_name="c", proposal="p", justification="j", proposer_confidence=0.5,
+        target_skill="solo", credited_bullets=bullets,  # no applied_skills
+    )
+    assert loop._credit_playbook(mr) == 1
+
+
 def test_schema_bullet_op_validation():
     # add requires text
     with pytest.raises(Exception):

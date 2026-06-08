@@ -37,7 +37,16 @@ def resolve_data_dirs(
     resolved: list[str] = []
     for raw in data_dirs or []:
         path = Path(raw)
-        resolved.append(str(path if path.is_absolute() else (root / path).resolve()))
+        if path.is_absolute():
+            resolved.append(str(path))
+            continue
+
+        cwd_path = (Path.cwd() / path).resolve()
+        if cwd_path.exists():
+            resolved.append(str(cwd_path))
+            continue
+
+        resolved.append(str((root / path).resolve()))
     return resolved
 
 
@@ -48,7 +57,7 @@ def resolve_data_dirs(
 def build_options(
     *,
     system: str,
-    schema: dict[str, Any],
+    schema: dict[str, Any] | None,
     tools: Iterable[str],
     project_root: str | Path | None = None,
     model: str | None = None,

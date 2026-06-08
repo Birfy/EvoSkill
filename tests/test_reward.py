@@ -519,6 +519,30 @@ class TestScoreAnswer:
     def test_text_mismatch_scores_zero(self):
         assert score_answer("yes", "no") == 0.0
 
+    def test_compact_numeric_vector_scores_one(self):
+        assert score_answer(
+            "[-0.153, 0.847, -1.162]",
+            "[-0.153,0.847,-1.162]",
+        ) == 1.0
+
+    def test_numeric_vector_order_matters(self):
+        assert score_answer(
+            "[-0.153, 0.847, -1.162]",
+            "[0.847,-0.153,-1.162]",
+        ) == 0.0
+
+    def test_comma_thousands_numeric_answer_still_scores_one(self):
+        assert score_answer("155276", "155,276 thousand U.S. dollars") == 1.0
+
+    @pytest.mark.parametrize("gt,pred", [
+        ("4226", "4,226 thousand U.S. dollars"),
+        ("113864", "113,864 thousand dollars"),
+        ("25258095.24", "25,258,095.24 fine pounds"),
+        ("0.88525", "0.88525 percentage points"),
+    ])
+    def test_pure_numeric_ground_truth_allows_prediction_units(self, gt, pred):
+        assert score_answer(gt, pred) == 1.0
+
     @pytest.mark.parametrize("gt,pred,tol,expected", [
         ("100", "100", 0.0, 1.0),
         ("100", "105", 0.05, 1.0),   # within 5%

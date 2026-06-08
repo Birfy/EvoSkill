@@ -6,12 +6,13 @@ self-improving agent loops with git-based versioning.
 Example usage:
     from src.loop import SelfImprovingLoop, LoopConfig, LoopAgents
     from src.harness import Agent
-    from src.agent_profiles import base_agent_options, proposer_options
+    from src.agent_profiles import base_agent_options, skill_proposer_options, prompt_proposer_options
     from src.registry import ProgramManager
 
     agents = LoopAgents(
         base=Agent(base_agent_options, AgentResponse),
-        proposer=Agent(proposer_options, ProposerResponse),
+        skill_proposer=Agent(skill_proposer_options, SkillProposerResponse),
+        prompt_proposer=Agent(prompt_proposer_options, PromptProposerResponse),
         skill_generator=Agent(skill_generator_options, ToolGeneratorResponse),
         prompt_generator=Agent(prompt_generator_options, PromptGeneratorResponse),
     )

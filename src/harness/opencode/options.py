@@ -133,13 +133,19 @@ def build_opencode_options(
             f"{dirs_note}"
         )
 
+    opencode_tools = to_opencode_tools(tools)
+    # Dataset and evaluation runs are unattended. OpenCode exposes its built-in
+    # question tool even when it is not requested, which can block forever
+    # waiting for interactive input.
+    opencode_tools["question"] = False
+
     return {
         "system": system_with_dirs,
         "format": {
             "type": "json_schema",
             "schema": schema,
         },
-        "tools": to_opencode_tools(tools),
+        "tools": opencode_tools,
         "mode": mode,
         "provider_id": provider_id,
         "model_id": model_id,

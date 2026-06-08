@@ -7,16 +7,10 @@ from src.schemas import SkillProposerResponse
 from src.agent_profiles.skill_proposer.prompt import SKILL_PROPOSER_SYSTEM_PROMPT
 
 
-SKILL_PROPOSER_TOOLS = [
-    "Read",
-    "Bash",
-    "Glob",
-    "Grep",
-    "WebFetch",
-    "WebSearch",
-    "TodoWrite",
-    "BashOutput",
-]
+# The proposer receives compact trajectory evidence and current SKILL.md text in
+# its query. Tool access adds long agentic loops and makes structured output less
+# reliable without adding information.
+SKILL_PROPOSER_TOOLS: list[str] = []
 
 
 def get_skill_proposer_options(

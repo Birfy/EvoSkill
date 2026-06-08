@@ -6,6 +6,7 @@ from reward import score_answer
 score = score_answer(ground_truth, predicted, tolerance)
 """
 
+import ast
 import re
 
 def normalize_text(text: str) -> str:
@@ -77,6 +78,62 @@ def extract_numbers_with_context(text: str) -> list[tuple[float, str, bool, bool
         numbers_with_context.append((num, context, has_percent, is_negative))
 
     return numbers_with_context
+
+
+def parse_numeric_vector(text: str) -> list[float] | None:
+    """Parse a bracketed numeric vector such as ``[-0.153,0.847,-1.162]``.
+
+    The generic number extractor removes commas before matching numbers, which
+    is correct for thousands separators but wrong for compact vectors where
+    commas are delimiters. This parser handles those vector answers before the
+    generic numeric matcher runs.
+    """
+    if not text:
+        return None
+
+    normalized = normalize_text(str(text)).strip()
+    match = re.search(r"\[[^\[\]]+\]", normalized)
+    if not match:
+        return None
+
+    try:
+        parsed = ast.literal_eval(match.group(0))
+    except (SyntaxError, ValueError):
+        return None
+
+    if not isinstance(parsed, (list, tuple)) or not parsed:
+        return None
+
+    values: list[float] = []
+    for item in parsed:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        values.append(float(item))
+    return values
+
+
+def numeric_vectors_match(
+    ground_truth: str,
+    predicted: str,
+    tolerance: float = 0.0,
+) -> bool | None:
+    """Return vector comparison result, or None when inputs are not vectors."""
+    gt_values = parse_numeric_vector(ground_truth)
+    pred_values = parse_numeric_vector(predicted)
+    if gt_values is None and pred_values is None:
+        return None
+    if gt_values is None or pred_values is None:
+        return False
+    if len(gt_values) != len(pred_values):
+        return False
+
+    for gt, pred in zip(gt_values, pred_values):
+        if gt == 0:
+            if abs(pred) > tolerance:
+                return False
+        elif abs(gt - pred) / abs(gt) > tolerance:
+            return False
+    return True
 
 
 def detect_unit_in_context(context: str) -> tuple[str | None, float]:
@@ -283,6 +340,12 @@ def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float = 0.0
         raise ValueError("Predicted answer cannot be empty")
     if not 0 <= tolerance <= 1:
         raise ValueError(f"Tolerance must be between 0 and 1, got {tolerance}")
+
+    vector_match = numeric_vectors_match(ground_truth, predicted, tolerance)
+    if vector_match is True:
+        return True, "Vector match: bracketed numeric vectors match positionally"
+    if vector_match is False:
+        return False, "Vector mismatch: bracketed numeric vectors differ"
 
     try:
         # Extract numbers with context

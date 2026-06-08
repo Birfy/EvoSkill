@@ -118,6 +118,110 @@ def test_judge_relative_score_uses_explicit_match_score():
     assert advantage == pytest.approx(-0.10)
 
 
+def test_anthropic_message_text_skips_thinking_blocks():
+    class ThinkingBlock:
+        type = "thinking"
+
+        def model_dump(self):
+            return {"type": "thinking", "thinking": "internal reasoning"}
+
+    class TextBlock:
+        text = '{"score": 0.7}'
+
+    response = types.SimpleNamespace(content=[ThinkingBlock(), TextBlock()])
+
+    assert SelfImprovingLoop._extract_anthropic_message_text(response) == '{"score": 0.7}'
+
+
+def test_parse_judge_json_text_accepts_wrapped_json():
+    text = 'Judge result:\n```json\n{"b_over_a_score": 0.62, "confidence": 0.8}\n```'
+
+    data = SelfImprovingLoop._parse_judge_json_text(text)
+
+    assert data["b_over_a_score"] == pytest.approx(0.62)
+    assert data["confidence"] == pytest.approx(0.8)
+
+
+def test_regression_match_policy_never_rewards_candidate():
+    assert SelfImprovingLoop._apply_regression_match_policy(0.9, 1.5) == pytest.approx(0.5)
+    assert SelfImprovingLoop._apply_regression_match_policy(0.5, 1.5) == pytest.approx(0.5)
+    assert SelfImprovingLoop._apply_regression_match_policy(0.46, 1.5) == pytest.approx(0.5)
+    assert SelfImprovingLoop._apply_regression_match_policy(0.4, 1.5) == pytest.approx(0.35)
+
+
+def test_unrelated_failure_match_policy_neutralizes_off_target_cases():
+    assert SelfImprovingLoop._apply_unrelated_failure_match_policy(0.2, 0.1) == pytest.approx(0.5)
+    assert SelfImprovingLoop._apply_unrelated_failure_match_policy(0.8, 0.1) == pytest.approx(0.5)
+    assert SelfImprovingLoop._apply_unrelated_failure_match_policy(0.8, 0.6) == pytest.approx(0.8)
+
+
+def test_case_relevance_falls_back_to_root_fit_fields():
+    unrelated = {
+        "skill_addresses_root_cause": 0.0,
+        "proposer_root_cause_correct": 0.0,
+        "failure_mechanism_encoding": 0.2,
+    }
+    related = {
+        "skill_addresses_root_cause": 0.8,
+        "proposer_root_cause_correct": 0.0,
+        "failure_mechanism_encoding": 0.1,
+    }
+
+    assert SelfImprovingLoop._judge_case_relevance(unrelated) == pytest.approx(0.1)
+    assert SelfImprovingLoop._judge_case_relevance(related) == pytest.approx(0.8)
+
+
+def test_mean_root_fit_ignores_unrelated_failures_and_regressions():
+    related = JudgeMatchResult(
+        index=1,
+        category="hard",
+        would_succeed=True,
+        confidence=0.8,
+        match_score=0.8,
+        expected_before=0.5,
+        child_rating_after=1500.0,
+        opponent_rating_after=1500.0,
+        hypothetical_action="",
+        reasoning="",
+        raw_response="{}",
+        case_relevance=0.9,
+        skill_addresses_root_cause=0.8,
+    )
+    unrelated = JudgeMatchResult(
+        index=2,
+        category="hard",
+        would_succeed=False,
+        confidence=0.8,
+        match_score=0.5,
+        expected_before=0.5,
+        child_rating_after=1500.0,
+        opponent_rating_after=1500.0,
+        hypothetical_action="",
+        reasoning="",
+        raw_response="{}",
+        case_relevance=0.1,
+        skill_addresses_root_cause=0.0,
+    )
+    regression = JudgeMatchResult(
+        index=3,
+        category="easy:regression",
+        would_succeed=True,
+        confidence=0.8,
+        match_score=0.5,
+        expected_before=0.5,
+        child_rating_after=1500.0,
+        opponent_rating_after=1500.0,
+        hypothetical_action="",
+        reasoning="",
+        raw_response="{}",
+        case_relevance=0.9,
+        skill_addresses_root_cause=0.0,
+    )
+    result = types.SimpleNamespace(matches=[related, unrelated, regression])
+
+    assert SelfImprovingLoop._mean_root_cause_fit(result) == pytest.approx(0.8)
+
+
 def test_elo_expected_probability_is_symmetric():
     equal = SelfImprovingLoop._elo_expected(1500.0, 1500.0, 400.0)
     stronger = SelfImprovingLoop._elo_expected(1700.0, 1500.0, 400.0)
@@ -240,6 +344,35 @@ def test_puct_selection_descends_before_filling_unsaturated_root():
     assert selected is first
 
 
+def test_discarded_children_do_not_consume_puct_capacity():
+    loop = object.__new__(SelfImprovingLoop)
+    loop.config = LoopConfig(puct_children_per_node=2, puct_max_depth=2, puct_c=0.5)
+
+    root = ProgramSearchNode("base", None, score=0.6, visit_count=3, total_q=1.8)
+    root.children.extend(
+        [
+            ProgramSearchNode(
+                "discarded-1",
+                root,
+                score=0.2,
+                depth=1,
+                discarded=True,
+            ),
+            ProgramSearchNode(
+                "discarded-2",
+                root,
+                score=0.3,
+                depth=1,
+                discarded=True,
+            ),
+        ]
+    )
+
+    assert loop._active_puct_child_count(root) == 0
+    assert root in loop._collect_expandable_puct_nodes(root)
+    assert loop._select_puct_node(root) is root
+
+
 def test_invalid_judge_match_is_neutral_and_marked_invalid():
     match = JudgeMatchResult(
         index=1,
@@ -289,7 +422,90 @@ def test_openai_gpt5_judge_uses_max_completion_tokens(monkeypatch):
 
     asyncio.run(loop._call_judge_api("prompt", "openai", "gpt-5.4-nano"))
 
-    assert captured["max_completion_tokens"] == 512
+    assert captured["max_completion_tokens"] == 1536
+
+
+def test_judge_call_allows_explicit_output_budget(monkeypatch):
+    loop = object.__new__(SelfImprovingLoop)
+    captured = {}
+
+    class Usage:
+        input_tokens = 1
+        output_tokens = 1
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            block = types.SimpleNamespace(text='{"b_over_a_score": 0.5}')
+            return types.SimpleNamespace(content=[block], usage=Usage())
+
+    class FakeAnthropic:
+        def __init__(self, api_key):
+            self.messages = FakeMessages()
+
+    fake_anthropic = types.SimpleNamespace(AsyncAnthropic=FakeAnthropic)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(
+        "src.harness.provider_auth.ensure_provider_api_key",
+        lambda provider: "test-key",
+    )
+
+    text = asyncio.run(
+        loop._call_judge_api(
+            "prompt",
+            "anthropic",
+            "deepseek-v4-flash",
+            max_output_tokens=4096,
+        )
+    )
+
+    assert text == '{"b_over_a_score": 0.5}'
+    assert captured["max_tokens"] == 4096
+
+
+def test_anthropic_judge_retries_thinking_only_response(monkeypatch):
+    loop = object.__new__(SelfImprovingLoop)
+    loop.config = LoopConfig(judge_max_output_tokens=2048)
+    calls = []
+
+    class Usage:
+        input_tokens = 1
+        output_tokens = 1
+
+    class ThinkingBlock:
+        type = "thinking"
+
+        def model_dump(self):
+            return {"type": "thinking", "thinking": "internal reasoning"}
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return types.SimpleNamespace(
+                    content=[ThinkingBlock()],
+                    stop_reason="end_turn",
+                    usage=Usage(),
+                )
+            block = types.SimpleNamespace(text='{"b_over_a_score": 0.5}')
+            return types.SimpleNamespace(content=[block], usage=Usage())
+
+    class FakeAnthropic:
+        def __init__(self, api_key):
+            self.messages = FakeMessages()
+
+    fake_anthropic = types.SimpleNamespace(AsyncAnthropic=FakeAnthropic)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr(
+        "src.harness.provider_auth.ensure_provider_api_key",
+        lambda provider: "test-key",
+    )
+
+    text = asyncio.run(loop._call_judge_api("judge prompt", "anthropic", "deepseek-v4-flash"))
+
+    assert text == '{"b_over_a_score": 0.5}'
+    assert len(calls) == 2
+    assert calls[1]["messages"][0]["content"].startswith("Return the required JSON object now")
 
 
 def test_codex_sdk_uses_codex_judge_provider(monkeypatch):
