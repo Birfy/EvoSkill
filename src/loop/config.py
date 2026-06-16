@@ -130,6 +130,13 @@ class LoopConfig:
     # keeps frontier selection from over-trusting nodes with only a few judged
     # comparisons or uncertain judge outputs.
     judge_bt_uncertainty_penalty: float = 0.05
+    # Drop non-informative draws from the Bradley-Terry fit. A narrow skill is
+    # judged on many cases it does not address; those return ~0.5 ("no effect")
+    # and, counted as ties, regress every node's rating toward the anchor over
+    # iterations (scores decay to base). Matches within this epsilon of 0.5 are
+    # excluded from the fit so ratings reflect decisive wins/losses only.
+    # Decisive regression over-trigger losses sit far below 0.5 and are kept.
+    bt_draw_epsilon: float = 0.05
     # Asymmetric regression penalty. Breaking a case that was already correct is
     # worse than fixing a new failure is good, so when the candidate scores below
     # 0.5 on a regression case (likely broke it) the below-0.5 deviation is
@@ -191,6 +198,51 @@ class LoopConfig:
     executable_skill_test_max_cases: int = 4
     executable_skill_test_concurrency: int = 2
     executable_skill_test_timeout_seconds: int = 240
+
+    # Before PUCT search, sweep ALL collected failures (grouped by failure_type,
+    # batched by failure_sample_count) and generate a skill per cluster, chaining
+    # the accepted ones into one growing "seed" program. Guarantees every failure
+    # task enters a proposer batch (full coverage) instead of the ~31% the PUCT
+    # tree covers before exhausting. A swept skill is accepted into the seed iff
+    # it passes its own over-trigger (negative) self-tests; PUCT + frontier
+    # distillation then refine and prune. The seed becomes the PUCT root and the
+    # Bradley-Terry gauge anchor (base only survives as the hidden 0.70 origin).
+    sweep_failures_before_puct: bool = True
+    # Run the over-trigger self-test gate during the sweep (author verifier tests +
+    # execute them, reject skills that over-trigger). Off by default: the verifier
+    # runs on the slow evolution model and is the dominant sweep cost. With it off
+    # the sweep just generates and accepts every skill; PUCT + frontier distillation
+    # (per-skill pruning) handle quality and over-trigger removal afterward.
+    sweep_self_test_gate: bool = False
+
+    # Resume from an already-swept seed program instead of re-running the (expensive,
+    # ~hours) failure-coverage sweep. When set to a program name, the loop skips the
+    # sweep, adopts that program's accumulated skills as the seed, re-derives a
+    # faithful description for each skill from its body (repairing any prior
+    # description corruption), and proceeds straight to PUCT. Empty = run the sweep.
+    sweep_resume_seed: str = ""
+
+    # --- Trigger-fit calibration (runs once, right after the sweep) ---
+    # The deployed agent sees ONLY each skill's `description` in the skill list and
+    # decides invocation from that line alone. The evolver otherwise never measures
+    # this: generic skills get broad descriptions that fire on everything (net-zero
+    # noise) while mechanism skills get abstract descriptions that never fire. After
+    # the sweep, probe each skill's DESCRIPTION-level firing with a cheap router call
+    # (no agent run): show the skill list + a task, ask which skills would be invoked.
+    # Measure recall (fires on the failures it targets) and false_trigger (fires on
+    # passing tasks it should ignore), tune the descriptions to fix over/under-firing,
+    # then keep the best-fitting `max_active_skills` (value-based budget) — replacing
+    # the arrival-order freeze-and-fold that buried distinct mechanisms in mega-skills.
+    calibrate_trigger_fit: bool = True
+    trigger_probe_targets: int = 6          # target failures sampled per skill (recall)
+    trigger_probe_holdout: int = 8          # passing tasks sampled (shared, false-trigger)
+    trigger_recall_min: float = 0.5         # recall below this => description too narrow
+    trigger_false_trigger_max: float = 0.4  # false-trigger above this => too broad
+    trigger_tune_rounds: int = 2            # max description-rewrite iterations
+    # After calibration, evict the lowest trigger-fit skills down to max_active_skills.
+    # Off by default: keep every distinct mechanism the sweep created+tuned (the
+    # active-skill budget then only governs folding during PUCT, not sweep retention).
+    trigger_fit_evict_to_budget: bool = False
 
     # Champion-gated staged dueling (Bradley-Terry mode). A new child first duels
     # the current frontier champion. If it clearly loses (the candidate-vs-champion

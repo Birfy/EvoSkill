@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+import math
 import re
 
 from src.harness.opencode.skill_utils import (
@@ -452,14 +453,15 @@ def build_answer_comparison_feedback(
     failure_type: str = "",
     domain_hints: dict[str, list[str]] | None = None,
 ) -> str:
-    """Create structured, non-oracle comparison feedback for proposer prompts.
+    """Create structured comparison feedback for proposer prompts.
 
-    Deliberately answer-blind: it never emits the predicted answer, the expected
-    (ground-truth) answer, or any signed delta/ratio that would let the skill
-    author reconstruct the answer (predicted ± delta = expected). It exposes only
-    the *shape* of the error (arity, scale-factor, close/large bucket) and the
-    likely verification surfaces, so the proposer learns a general procedure
-    instead of memorizing per-task answers.
+    Answer-AWARE: it shows the predicted and expected answers so the proposer can
+    diagnose the true root cause (e.g. a predicted/expected ratio that reveals a
+    wrong prefactor/convention, a sign flip, a power-of-ten unit error, or excess
+    significant figures). It still adds the *shape* labels and likely verification
+    surfaces. The answers are for DIAGNOSIS ONLY — the resulting skill must encode a
+    general mechanism (correct convention/procedure/contract), never the specific
+    answer/delta/value; the proposer prompt enforces this anti-memorization rule.
     """
     pred_nums = _extract_numbers(predicted)
     exp_nums = _extract_numbers(expected)
@@ -467,6 +469,16 @@ def build_answer_comparison_feedback(
     lines = []
     if failure_type:
         lines.append(f"- failure_type: {failure_type}")
+    # Show the actual answers for root-cause diagnosis (not for memorization).
+    lines.append(f"- predicted_answer: {str(predicted).strip()[:120]}")
+    lines.append(f"- expected_answer: {str(expected).strip()[:120]}")
+    if pred_nums and exp_nums:
+        try:
+            p0, e0 = pred_nums[0], exp_nums[0]
+            if e0 not in (0.0, -0.0):
+                lines.append(f"- predicted/expected ratio: {p0 / e0:.4g} (inspect for sign flip, power-of-ten, or prefactor convention)")
+        except (IndexError, ZeroDivisionError):
+            pass
 
     if pred_nums and exp_nums:
         pairs = list(zip(pred_nums, exp_nums))
@@ -492,9 +504,12 @@ def build_answer_comparison_feedback(
         "above; do not assume final-answer formatting is the root cause."
     )
     lines.append(
-        "- required_proposer_fix: propose a reusable verification gate that would force the agent "
-        "to expose and check the earliest divergent intermediate. Do NOT hardcode any specific "
-        "answer or wrong value into the skill; worked examples must use general/synthetic placeholders."
+        "- required_proposer_fix: use the predicted/expected answers above ONLY to identify the "
+        "mechanism (wrong convention/prefactor, sign, unit/scale, excess significant figures, wrong "
+        "selection, output contract), then propose the reusable fix for that mechanism — a check when "
+        "the agent skipped a self-checkable step, or the correct general fact when it lacked knowledge. "
+        "Do NOT hardcode the specific answer, delta, or value; the skill must work on unseen tasks with "
+        "different numbers, and worked examples must use synthetic placeholders."
     )
     return "\n".join(lines)
 
@@ -522,15 +537,42 @@ def _numeric_mismatch_shape(
     if n_pred != n_exp:
         labels.append(f"numeric_arity_mismatch(pred={n_pred}, expected={n_exp})")
     if ratios:
-        max_ratio_gap = max(abs(r - 1.0) for r in ratios)
-        if any(abs(abs(r) - 10.0) < 0.5 or abs(abs(r) - 100.0) < 5.0 for r in ratios):
-            labels.append("possible_scale_factor_error")
-        elif max_ratio_gap < 0.02:
-            labels.append("close_numeric_mismatch")
-        elif max_ratio_gap > 0.5:
-            labels.append("large_numeric_mismatch")
-        else:
-            labels.append("moderate_numeric_mismatch")
+        # A negative ratio (p/e < 0) means predicted and expected have opposite
+        # signs. When |ratio| is also near 1 the magnitude is right but the sign
+        # is flipped — a distinct, common failure mode (dropped minus sign,
+        # wrong reaction direction, wrong reference state) that must be labeled
+        # separately so the proposer can target it instead of lumping it into a
+        # generic "large mismatch".
+        if any(r < 0 for r in ratios):
+            if any(r < 0 and abs(abs(r) - 1.0) < 0.1 for r in ratios):
+                labels.append("sign_flip_only(magnitude_ok)")
+            else:
+                labels.append("sign_flip_suspected")
+        # Scale-factor error: |ratio| close to a nonzero power of ten (10x, 100x,
+        # 1e-3x, ...). Generalized from the old 10x/100x-only check so unit or
+        # magnitude conversion mistakes at any decade are surfaced.
+        scale_powers = []
+        for r in ratios:
+            ar = abs(r)
+            if ar > 0:
+                p10 = math.log10(ar)
+                nearest = round(p10)
+                if nearest != 0 and abs(p10 - nearest) < 0.08:
+                    scale_powers.append(nearest)
+        if scale_powers:
+            labels.append(
+                "possible_scale_factor_error(decade_off~="
+                + ",".join(str(p) for p in sorted(set(scale_powers)))
+                + ")"
+            )
+        max_ratio_gap = max(abs(abs(r) - 1.0) for r in ratios)
+        if not scale_powers and not any(r < 0 for r in ratios):
+            if max_ratio_gap < 0.02:
+                labels.append("close_numeric_mismatch")
+            elif max_ratio_gap > 0.5:
+                labels.append("large_numeric_mismatch")
+            else:
+                labels.append("moderate_numeric_mismatch")
     elif abs_diffs:
         labels.append("numeric_mismatch")
     return ", ".join(labels) if labels else "numeric_mismatch"
@@ -550,9 +592,32 @@ def _likely_error_surfaces(
         if any(kw in question_lc for kw in keywords):
             surfaces.append(surface)
     if pred_nums and exp_nums and len(pred_nums) == len(exp_nums):
-        deltas = [abs(p - e) for p, e in zip(pred_nums, exp_nums)]
+        pairs = list(zip(pred_nums, exp_nums))
+        deltas = [abs(p - e) for p, e in pairs]
         if deltas and max(deltas) <= 1.0:
             surfaces.append("small numeric drift: rounding stage, interpolation method, boundary value")
+        # Opposite-sign pairs => inspect sign conventions, not arithmetic.
+        if any((p < 0) != (e < 0) for p, e in pairs if p != 0 and e != 0):
+            surfaces.append(
+                "sign convention: dropped/added minus sign, reaction or process "
+                "direction reversed, wrong reference/zero point, |x| vs x"
+            )
+        # Power-of-ten magnitude gap => unit/prefix conversion surface.
+        for p, e in pairs:
+            if p != 0 and e != 0:
+                p10 = math.log10(abs(p / e))
+                if abs(p10 - round(p10)) < 0.08 and round(p10) != 0:
+                    surfaces.append(
+                        "unit/magnitude conversion: SI prefix (k/m/μ/n), "
+                        "per-mole vs per-molecule, percent vs fraction, "
+                        "exponent or power-of-ten bookkeeping"
+                    )
+                    break
+    if not pred_nums or not exp_nums:
+        surfaces.append(
+            "output contract: final answer not a parseable bare number "
+            "(stray label, units, prose, or wrong field) — check ANSWER format"
+        )
     if not surfaces:
         surfaces.append("answer parsing/formatting or unclassified semantic mismatch")
     return surfaces
@@ -742,10 +807,11 @@ def build_skill_query_from_skill_proposer(
 
     return f"""Proposed tool or skill (high level description): {proposer_trace.output.proposed_skill}
 
-Filesystem rule: use only the information in this prompt. Do not search `/home`,
-`/tmp`, `.codex`, historical runs, or unrelated repos for existing skills or
-examples. For a new skill, produce `.claude/skills/<skill-name>/SKILL.md` from
-the proposal and the provided evidence only.
+Filesystem rule: use only the information in this prompt. Do not read any
+external files — especially do not read trajectory files (.jsonl), dataset files
+(.csv), or any files under `.evoskill/trajectories/`. Do not search `/home`,
+`/tmp`, `.codex`, historical runs, or unrelated repos. For a new skill, produce
+`.claude/skills/<skill-name>/SKILL.md` from the proposal and evidence only.
 
 Justification: {proposer_trace.output.justification}
 

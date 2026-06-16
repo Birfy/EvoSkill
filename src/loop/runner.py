@@ -383,6 +383,10 @@ class SelfImprovingLoop:
         # picked first so successive iterations sweep distinct failures instead
         # of repeatedly re-proposing on the same few.
         self._failure_shown_count: dict[str, int] = {}
+        # Evolution root for the LLM-judge loop: "base", or the seed program from
+        # the pre-PUCT coverage sweep. Used as the BT gauge anchor and to exclude
+        # base from head-to-head anchors.
+        self._evolution_root: str = "base"
         if preloaded_trajectories:
             cats = sorted({entry[4] for entry in preloaded_trajectories})
             self._per_cat_offset: dict[str, int] = {cat: 0 for cat in cats}
@@ -1043,9 +1047,10 @@ class SelfImprovingLoop:
 Modifications needed:
 {proposed}
 
-Filesystem rule: the authoritative current skill is printed below. Do not search
-`/home`, `/tmp`, `.codex`, historical runs, or unrelated repos for other versions
-of this skill. If you need to reference a path, use only:
+Filesystem rule: the authoritative current skill is printed below. Do not read
+any external files — especially do not read trajectory files (.jsonl), dataset
+files (.csv), or any files under `.evoskill/trajectories/`. Do not search
+`/home`, `/tmp`, `.codex`, historical runs, or unrelated repos. Use only:
 `.claude/skills/{target_skill}/SKILL.md`.
 
 Justification: {justification}
@@ -1290,6 +1295,11 @@ Regression risks / anti-regression guards:
             should_not_apply_when = getattr(proposer_output, "should_not_apply_when", "") or ""
             invariants_to_preserve = getattr(proposer_output, "invariants_to_preserve", "") or ""
             regression_risks = getattr(proposer_output, "regression_risks", "") or ""
+            action_type = proposer_output.action
+            target_skill = proposer_output.target_skill
+            # Edits modify an existing SKILL.md that already carries its boundary
+            # sections, so the proposer need not re-supply them; only a create
+            # (which must produce a complete new skill) requires all boundaries.
             required_boundaries = {
                 "should_apply_when": should_apply_when,
                 "should_not_apply_when": should_not_apply_when,
@@ -1299,7 +1309,7 @@ Regression risks / anti-regression guards:
             missing_boundaries = [
                 name for name, value in required_boundaries.items() if not value.strip()
             ]
-            if missing_boundaries:
+            if missing_boundaries and not (action_type == "edit" and target_skill):
                 _log(
                     "",
                     (
@@ -1312,8 +1322,6 @@ Regression risks / anti-regression guards:
                 getattr(proposer_output, "confidence", None),
                 default=self.config.puct_default_prior,
             )
-            action_type = proposer_output.action
-            target_skill = proposer_output.target_skill
             _log(
                 "PROPOSER",
                 (
@@ -1365,11 +1373,12 @@ Regression risks / anti-regression guards:
                 skill_query = f"""EDIT existing skill: {target_skill}
 
 Modifications needed:
-{proposed}
+{proposed.strip() or justification}
 
-Filesystem rule: the authoritative current skill is printed below. Do not search
-`/home`, `/tmp`, `.codex`, historical runs, or unrelated repos for other versions
-of this skill. If you need to reference a path, use only:
+Filesystem rule: the authoritative current skill is printed below. Do not read
+any external files — especially do not read trajectory files (.jsonl), dataset
+files (.csv), or any files under `.evoskill/trajectories/`. Do not search
+`/home`, `/tmp`, `.codex`, historical runs, or unrelated repos. Use only:
 `.claude/skills/{target_skill}/SKILL.md`.
 
 Justification: {justification}
@@ -1831,8 +1840,22 @@ that is still relevant and return the complete revised file."""
         if not skill_name and self._is_valid_skill_name(generated_skill):
             skill_name = generated_skill
         if not skill_name or not self._is_valid_skill_name(skill_name):
-            _log("", f"  [WARN] Generator returned invalid skill name/path: {skill_name!r}")
-            return None
+            # The generator emitted an empty/reserved/degenerate name (e.g. a
+            # YAML-null surfacing as "null"). Derive a valid slug from the skill's
+            # own description rather than dropping an otherwise-usable skill.
+            derived = self._slugify_skill_name(
+                self._skill_description_from_markdown(skill_markdown)
+            ) or self._slugify_skill_name(fallback_description)
+            if derived:
+                _log(
+                    "",
+                    f"  [WARN] Generator returned invalid skill name {skill_name!r}; "
+                    f"using derived name {derived!r}",
+                )
+                skill_name = derived
+            else:
+                _log("", f"  [WARN] Generator returned invalid skill name/path: {skill_name!r}")
+                return None
         if not skill_markdown:
             if generated_skill == skill_name:
                 skill_markdown = (
@@ -1846,8 +1869,25 @@ that is still relevant and return the complete revised file."""
             else:
                 return None
 
+        # Keep the on-disk directory name and the frontmatter name in sync so a
+        # derived/edited skill is never invoked under a stale or degenerate name.
+        skill_markdown = self._force_frontmatter_name(skill_markdown, skill_name)
         skill_path = self._project_root / ".claude" / "skills" / skill_name / "SKILL.md"
         skill_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Repair a leaked edit-instruction in the description before it reaches the
+        # skill list. fallback_description is the proposer's edit prose ("Edit X:
+        # (1) Add a playbook bullet ..."), which must never become the trigger.
+        prior_desc = ""
+        if skill_path.exists():
+            prior_desc = self._skill_description_from_markdown(skill_path.read_text())
+        clean_desc = self._sanitize_skill_description(
+            self._skill_description_from_markdown(skill_markdown) or fallback_description,
+            prior=prior_desc,
+            body=skill_markdown,
+        )
+        skill_markdown = self._force_frontmatter_description(skill_markdown, clean_desc)
+
         if not skill_markdown.endswith("\n"):
             skill_markdown += "\n"
         skill_path.write_text(skill_markdown)
@@ -1856,7 +1896,7 @@ that is still relevant and return the complete revised file."""
 
         ensure_skill_frontmatter(
             skill_path,
-            description=fallback_description,
+            description=clean_desc,
             compatibility=None,
         )
         if getattr(self.config, "validate_worked_examples", False) and (
@@ -1950,11 +1990,148 @@ that is still relevant and return the complete revised file."""
         )
         return [name] if name else []
 
+    # Degenerate names a model emits when it leaves the name blank: a YAML/JSON
+    # null or a stray literal. They pass the slug regex but must never become a
+    # skill directory (".claude/skills/null/").
+    _RESERVED_SKILL_NAMES = frozenset(
+        {"null", "none", "nil", "nan", "true", "false", "undefined", "skill", "skills"}
+    )
+
     @staticmethod
     def _is_valid_skill_name(skill_name: str) -> bool:
         import re
 
+        if not skill_name or len(skill_name) < 3:
+            return False
+        if skill_name.lower() in SelfImprovingLoop._RESERVED_SKILL_NAMES:
+            return False
         return bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", skill_name))
+
+    @staticmethod
+    def _slugify_skill_name(text: str) -> str | None:
+        """Derive a valid hyphenated skill name from free text (e.g. a description)."""
+        import re
+
+        filler = {
+            "invoke", "when", "the", "a", "an", "for", "to", "of", "and", "or",
+            "is", "are", "agent", "skill", "this", "that", "with", "use", "using",
+            "should", "must", "be", "in", "on", "it",
+        }
+        words = [w for w in re.findall(r"[a-z0-9]+", str(text).lower()) if w not in filler]
+        slug = "-".join(words[:5])
+        return slug if SelfImprovingLoop._is_valid_skill_name(slug) else None
+
+    @staticmethod
+    def _skill_description_from_markdown(markdown: str) -> str:
+        import re
+
+        m = re.search(r"\A---\n(.*?)\n---", markdown, flags=re.DOTALL)
+        if not m:
+            return ""
+        d = re.search(r"(?m)^description:\s*(.+)$", m.group(1))
+        return d.group(1).strip().strip("'\"") if d else ""
+
+    @staticmethod
+    def _force_frontmatter_name(markdown: str, name: str) -> str:
+        """Rewrite the frontmatter ``name:`` so it matches the resolved dir name."""
+        import re
+
+        m = re.match(r"\A---\n(.*?)\n---", markdown, flags=re.DOTALL)
+        if not m:
+            return markdown
+        fm = m.group(1)
+        if re.search(r"(?m)^name:\s*.*$", fm):
+            new_fm = re.sub(r"(?m)^name:\s*.*$", f"name: {name}", fm, count=1)
+        else:
+            new_fm = f"name: {name}\n{fm}"
+        return markdown[: m.start(1)] + new_fm + markdown[m.end(1) :]
+
+    @staticmethod
+    def _force_frontmatter_description(markdown: str, description: str) -> str:
+        """Rewrite the frontmatter ``description:`` (the only deployed trigger surface).
+
+        Handles a multi-line YAML description value: the old single-line regex
+        replaced only the ``description:`` line and orphaned its indented
+        continuation lines, leaving a corrupt frontmatter that callers (and the
+        deployed agent) could not read. Here the whole key — its line plus every
+        continuation line up to the next top-level key — is removed and replaced
+        with one clean single-line description.
+        """
+        import re
+
+        m = re.match(r"\A---\n(.*?)\n---", markdown, flags=re.DOTALL)
+        if not m:
+            return markdown
+        one_line = " ".join(str(description).split())
+        lines = m.group(1).split("\n")
+        out: list[str] = []
+        i = 0
+        replaced = False
+        key_re = re.compile(r"^[A-Za-z0-9_][\w.-]*\s*:")
+        while i < len(lines):
+            if re.match(r"^description\s*:", lines[i]):
+                i += 1
+                # Consume continuation lines (indented / backslash-folded / blank)
+                # until the next top-level YAML key.
+                while i < len(lines) and not key_re.match(lines[i]):
+                    i += 1
+                out.append(f"description: {one_line}")
+                replaced = True
+            else:
+                out.append(lines[i])
+                i += 1
+        if not replaced:
+            out.append(f"description: {one_line}")
+        new_fm = "\n".join(out)
+        return markdown[: m.start(1)] + new_fm + markdown[m.end(1) :]
+
+    # Strong multi-word phrases that betray an edit-instruction / changelog wrongly
+    # placed in the description (the only text the model sees when deciding to invoke
+    # a skill). Deliberately specific: a merely long description is NOT corruption —
+    # only prose that reads as a change instruction is.
+    _BAD_DESCRIPTION_MARKERS = (
+        "playbook bullet",
+        "no other changes",
+        "add a new bullet",
+        "add two new",
+        "to the skill body",
+        "edit the skill",
+        "no change to the skill",
+        "expand the \"when",
+        "expand the when to use",
+    )
+
+    @classmethod
+    def _sanitize_skill_description(
+        cls, candidate: str, *, prior: str = "", body: str = ""
+    ) -> str:
+        """Return a clean one-line trigger description, repairing instruction leaks.
+
+        The generator (especially on playbook edits, where ``fallback_description``
+        was the proposer's edit-instruction prose) sometimes wrote the change
+        instructions into ``description`` instead of a trigger. Such a description
+        never fires and pollutes the skill list. Detect that specific failure and
+        fall back to the skill's prior good description, then to the candidate's
+        first sentence. A long-but-valid trigger is left untouched.
+        """
+        def _bad(text: str) -> bool:
+            low = text.lower()
+            return any(mark in low for mark in cls._BAD_DESCRIPTION_MARKERS) or (
+                low.startswith("edit ") and "invoke when" not in low
+            )
+
+        one_line = " ".join(str(candidate or "").split())
+        if one_line and not _bad(one_line):
+            return one_line
+        prior_line = " ".join(str(prior or "").split())
+        if prior_line and not _bad(prior_line):
+            return prior_line
+        # Last resort: keep the candidate's first sentence (often the real trigger
+        # before the instruction prose begins), else a generic placeholder.
+        first = one_line.split(". ")[0].strip()
+        if first and not _bad(first):
+            return first[:300]
+        return "Invoke when this skill's documented trigger conditions are met."
 
     @staticmethod
     def _skill_name_from_path(text: str) -> str | None:
@@ -2193,7 +2370,13 @@ that is still relevant and return the complete revised file."""
         if not skills_dir.exists():
             return []
         allowed = {name for name in (skill_names or []) if name}
-        specs: list[tuple[str, dict[str, Any]]] = []
+        # Collect tests grouped per skill so the global cap below can be applied
+        # per-skill and round-robin, not as a flat truncation. A flat
+        # ``specs[:max_cases]`` over a sorted, concatenated list silently tested
+        # only the alphabetically-first skill whenever a bundle had more skills
+        # than ``max_cases`` tests — every other skill in a distilled bundle went
+        # completely untested, and one bad first skill failed the whole bundle.
+        per_skill: list[tuple[str, list[dict[str, Any]]]] = []
         for skill_dir in sorted(skills_dir.iterdir()):
             tests_file = skill_dir / "SKILL_TESTS.json"
             if not skill_dir.is_dir() or not tests_file.exists():
@@ -2208,11 +2391,34 @@ that is still relevant and return the complete revised file."""
             if not isinstance(payload, list):
                 _log("WARN", f"  [SELF-TEST] Ignoring non-list test payload: {tests_file}")
                 continue
-            for item in payload:
-                if isinstance(item, dict):
-                    specs.append((skill_dir.name, item))
+            items = [item for item in payload if isinstance(item, dict)]
+            if items:
+                per_skill.append((skill_dir.name, items))
+
         max_cases = max(0, int(self.config.executable_skill_test_max_cases))
-        return specs[:max_cases] if max_cases else []
+        if not max_cases or not per_skill:
+            return []
+
+        # ``max_cases`` is a PER-SKILL budget: every skill in the bundle gets up
+        # to ``max_cases`` of its own tests, so each skill is actually exercised.
+        # Negative (should-not-activate) tests are kept first within a skill's
+        # budget so the over-trigger hard gate always retains signal even if a
+        # downstream caller trims the list.
+        def _is_negative(item: dict[str, Any]) -> bool:
+            return item.get("should_activate") is False
+
+        capped: list[list[tuple[str, dict[str, Any]]]] = []
+        for skill_name, items in per_skill:
+            ordered = sorted(items, key=lambda it: not _is_negative(it))
+            capped.append([(skill_name, it) for it in ordered[:max_cases]])
+
+        # Round-robin interleave across skills so coverage stays balanced.
+        specs: list[tuple[str, dict[str, Any]]] = []
+        for col in range(max(len(c) for c in capped)):
+            for skill_specs in capped:
+                if col < len(skill_specs):
+                    specs.append(skill_specs[col])
+        return specs
 
     @staticmethod
     def _evidence_words(text: str) -> set[str]:
@@ -2681,6 +2887,35 @@ that is still relevant and return the complete revised file."""
             for case in result.cases
         )
 
+    @staticmethod
+    def _skills_failing_negative_tests(
+        result: ExecutableSkillTestSuiteResult | None,
+    ) -> set[str]:
+        """Skills that over-triggered on a should-not-activate case.
+
+        Mirrors ``_has_failed_negative_self_test`` but reports *which* skills are
+        responsible, so a distilled multi-skill bundle can prune just the
+        offenders instead of being rejected wholesale.
+        """
+        if result is None:
+            return set()
+        return {
+            case.skill_name
+            for case in result.cases
+            if not case.should_activate
+            and case.activated
+            and not case.passed
+            and case.skill_name
+        }
+
+    def _remove_skill_dirs(self, names: set[str] | list[str]) -> None:
+        """Delete the SKILL.md directories for ``names`` from the active project."""
+        skills_dir = self._project_root / ".claude" / "skills"
+        for name in names:
+            target = skills_dir / name
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+
     def _get_program_skills_content(self, program_name: str, restore_to: str | None = None) -> str:
         """Read active skills for a stored program and optionally restore another program."""
         try:
@@ -2708,16 +2943,6 @@ that is still relevant and return the complete revised file."""
             return None
 
         champion, champion_score = frontier[0]
-        top = frontier[: max(1, int(self.config.frontier_distill_top_k))]
-        source_parts: list[str] = []
-        for name, score in top:
-            content = self._get_program_skills_content(name, restore_to=champion)
-            source_parts.append(
-                f"## Frontier program: {name} (score={score:.4f})\n"
-                f"{content[:10000]}"
-            )
-        if not source_parts:
-            return None
 
         distilled_name = "frontier-distilled"
         if distilled_name in self.manager.list_programs():
@@ -2726,9 +2951,16 @@ that is still relevant and return the complete revised file."""
                 suffix += 1
             distilled_name = f"{distilled_name}-{suffix}"
 
+        # Retain the champion's FULL skill set as the distilled bundle, then prune
+        # only over-triggering skills below. We deliberately do NOT regenerate the
+        # bundle through the generator: its single-skill ToolGeneratorResponse
+        # schema cannot emit a multi-skill array, so the LLM "merge" collapsed an
+        # N-skill champion into one skill and the preceding rmtree threw the rest
+        # away. Starting from the champion's own skills guarantees the aggregate
+        # survives; per-skill pruning then removes only the harmful ones.
         _log(
             "DISTILL",
-            f"Distilling {len(top)} frontier program(s) into {distilled_name}...",
+            f"Distilling champion {champion} into {distilled_name} (retain + prune)...",
         )
         self.manager.switch_to(champion)
         champion_config = self.manager.get_current()
@@ -2737,73 +2969,57 @@ that is still relevant and return the complete revised file."""
             champion_config.mutate(distilled_name),
             parent=champion,
         )
-        skills_dir = self._project_root / ".claude" / "skills"
-        if skills_dir.exists():
-            shutil.rmtree(skills_dir)
-        skills_dir.mkdir(parents=True, exist_ok=True)
-
-        query = f"""Create a final distilled project skill bundle from the strongest frontier programs below.
-
-The output should preserve multiple independent mechanisms as multiple skills.
-Do not collapse unrelated mechanisms into one broad workflow skill. Merge only
-duplicates or near-duplicates. Remove conflicting instructions, benchmark-specific
-details, and rules supported by only one weak variant.
-
-Return JSON only in this shape:
-{{
-  "skills": [
-    {{
-      "name": "<lowercase-hyphen-name>",
-      "skill_path": ".claude/skills/<name>/SKILL.md",
-      "skill_markdown": "---\\nname: <name>\\ndescription: <activation-focused description>\\n---\\n...",
-      "skill_tests": [...]
-    }}
-  ]
-}}
-
-Each distilled skill must:
-- cover one clear failure-prevention mechanism with a narrow activation boundary;
-- preserve compatible high-risk blacklists and concrete executable checks;
-- explicitly say when not to activate;
-- stay out of tasks outside its boundary and unrelated task families;
-- avoid frontier names, scores, benchmark ids, sampled files, dates, or answers.
-
-## Frontier Skill Candidates
-{chr(10).join(source_parts)}
-"""
-        try:
-            trace = await self.agents.skill_generator.run(query)
-            self._add_iteration_cost(trace.total_cost_usd, "evolution")
-        except Exception as exc:  # noqa: BLE001
-            _log("WARN", f"  Frontier distillation generator failed: {exc}")
-            self.manager.discard(distilled_name)
-            self.manager.switch_to(champion)
-            return None
-        if trace.output is None:
-            _log("WARN", "  Frontier distillation produced no skill output")
-            self.manager.discard(distilled_name)
-            self.manager.switch_to(champion)
-            return None
-        skill_names = self._materialize_distilled_skill_bundle(
-            trace.output,
-            fallback_description="Distilled frontier skill bundle",
-        )
+        self.manager.switch_to(distilled_name)
+        skill_names = self._get_active_skills()
         if not skill_names:
-            _log("WARN", "  Frontier distillation did not materialize any SKILL.md")
+            _log("WARN", f"  {distilled_name}: champion has no active skills to distill")
             self.manager.discard(distilled_name)
             self.manager.switch_to(champion)
             return None
-        self.manager.commit(f"{distilled_name}: distilled frontier skill bundle")
+        _log(
+            "DISTILL",
+            f"  Retained {len(skill_names)} champion skill(s): {', '.join(skill_names)}",
+        )
+        self.manager.commit(f"{distilled_name}: retained champion skill bundle")
 
         await self._author_verifier_tests(skill_names)
         tests = await self._run_executable_skill_tests(skill_names)
+
+        # Per-skill pruning instead of all-or-nothing rejection: an N-skill bundle
+        # must not be discarded wholesale because one skill over-triggers. Drop
+        # only the skills whose own negative/over-trigger tests failed, keep the
+        # rest, and re-validate the survivors once. This is what preserves the
+        # aggregate of useful distilled mechanisms.
+        bad_skills = self._skills_failing_negative_tests(tests)
+        if bad_skills and len(bad_skills) < len(skill_names):
+            survivors = [s for s in skill_names if s not in bad_skills]
+            _log(
+                "DISTILL",
+                (
+                    f"Pruning {len(bad_skills)} over-triggering skill(s) from "
+                    f"{distilled_name}: {', '.join(sorted(bad_skills))}; "
+                    f"keeping {len(survivors)} ({', '.join(survivors)})"
+                ),
+            )
+            self._remove_skill_dirs(bad_skills)
+            self.manager.commit(
+                f"{distilled_name}: pruned {len(bad_skills)} over-triggering skill(s)"
+            )
+            skill_names = survivors
+            tests = await self._run_executable_skill_tests(skill_names)
+
         if (
-            self._has_failed_negative_self_test(tests)
+            not skill_names
+            or self._has_failed_negative_self_test(tests)
             or (tests.total > 0 and tests.pass_rate < self.config.refine_self_test_threshold)
         ):
             _log(
                 "DISTILL",
-                f"Rejected {distilled_name}: executable self-tests {tests.passed}/{tests.total}",
+                (
+                    f"Rejected {distilled_name}: executable self-tests "
+                    f"{tests.passed}/{tests.total}"
+                    + ("" if skill_names else " (no skills survived pruning)")
+                ),
             )
             self.manager.discard(distilled_name)
             self.manager.switch_to(champion)
@@ -2889,9 +3105,16 @@ Each distilled skill must:
         if best:
             candidates.append(best)
 
+        # When the evolution root is a swept seed (not bare base), base is only
+        # the hidden score origin and must never be a head-to-head opponent.
+        # When there was no sweep (root == "base"), base remains a valid anchor
+        # for backward compatibility.
+        root_name = getattr(self, "_evolution_root", "base")
         existing = set(self.manager.list_programs())
         anchors: list[str] = []
         for name in candidates:
+            if name == "base" and root_name != "base":
+                continue
             if name == child_name or name not in existing or name in anchors:
                 continue
             anchors.append(name)
@@ -4082,20 +4305,26 @@ Each distilled skill must:
             return 0.0
         return len(ta & tb) / len(ta | tb)
 
-    def _build_program_search_tree(self, base_score: float) -> ProgramSearchNode:
-        """Build an in-memory PUCT tree seeded from the current frontier."""
+    def _build_program_search_tree(
+        self, root_score: float, root_name: str = "base"
+    ) -> ProgramSearchNode:
+        """Build an in-memory PUCT tree seeded from the current frontier.
+
+        ``root_name`` is the evolution root — ``"base"`` normally, or the seed
+        program produced by the pre-PUCT coverage sweep.
+        """
         root = ProgramSearchNode(
-            name="base",
+            name=root_name,
             parent=None,
             prior=1.0,  # policy prior for root: maximum, decoupled from value (score)
-            score=base_score,
+            score=root_score,
             visit_count=1,
-            total_q=base_score,
+            total_q=root_score,
             depth=0,
         )
 
         for name, score in self.manager.get_frontier_with_scores():
-            if name == "base":
+            if name == root_name:
                 continue
             child = ProgramSearchNode(
                 name=name,
@@ -4110,6 +4339,627 @@ Each distilled skill must:
             root.visit_count += 1
             root.total_q += score
         return root
+
+    async def _sweep_failure_coverage(
+        self,
+        all_failures_ext: list[tuple[Any, ...]],
+        all_successes_ext: list[tuple[Any, ...]] | None = None,
+    ) -> str:
+        """Generate a skill for every failure cluster before PUCT search.
+
+        Groups all collected failures by failure_type and batches each group by
+        ``failure_sample_count``. For each batch it runs the proposer/generator
+        (``_mutate_with_fallback``) off the current seed program, authors and
+        runs the new skill's executable self-tests, and accepts the skill into
+        the growing seed iff it does not over-trigger (no failed negative test).
+        Every failure batch is processed, so all failure tasks enter a proposer
+        batch — full coverage instead of the fraction the PUCT tree reaches.
+
+        Returns the final seed program name (``"base"`` if nothing was accepted
+        or the sweep is disabled), which becomes the PUCT root and BT anchor.
+        """
+        if not self.config.sweep_failures_before_puct or not all_failures_ext:
+            return "base"
+
+        # Group by failure_type (fallback to category) for homogeneous batches.
+        groups: dict[str, list[tuple[Any, ...]]] = {}
+        for entry in all_failures_ext:
+            key = self._trajectory_failure_type(entry) or str(entry[4]) or "unclassified"
+            groups.setdefault(key, []).append(entry)
+
+        batch_size = max(1, self.config.failure_sample_count)
+        seed = "base"
+        accepted = 0
+        batch_idx = 0
+        # skill_name -> the failure questions that skill was created/edited to fix.
+        # Used by post-sweep trigger-fit calibration as each skill's recall probes.
+        target_map: dict[str, list[str]] = {}
+        total_batches = sum(
+            math.ceil(len(items) / batch_size) for items in groups.values()
+        )
+
+        # Let the sweep create a dedicated skill per distinct mechanism instead of
+        # folding later mechanisms into whatever skills happened to fill the budget
+        # first (arrival-order starvation: sign/unit, sorted last, always got folded
+        # into a mega-skill whose abstract description then never fired). The budget
+        # is re-imposed AFTER the sweep by trigger-fit calibration, which keeps the
+        # best-firing max_active_skills and evicts the rest by measured value.
+        _saved_budget = self.config.max_active_skills
+        if self.config.calibrate_trigger_fit:
+            self.config.max_active_skills = 0
+        _log(
+            "SWEEP",
+            (
+                f"Coverage sweep over {len(all_failures_ext)} failures in "
+                f"{len(groups)} failure_type group(s) → {total_batches} batch(es), "
+                f"batch_size={batch_size}"
+            ),
+        )
+
+        for ftype in sorted(groups):
+            items = groups[ftype]
+            for start in range(0, len(items), batch_size):
+                chunk = items[start : start + batch_size]
+                batch_idx += 1
+                # Mark every failure in the chunk as shown (coverage bookkeeping).
+                for entry in chunk:
+                    key = str(entry[1])
+                    self._failure_shown_count[key] = (
+                        self._failure_shown_count.get(key, 0) + 1
+                    )
+
+                batch_failures: list[tuple[Any, ...]] = []
+                questions: list[str] = []
+                for entry in chunk:
+                    trace, question, agent_answer, ground_truth, category = entry[:5]
+                    feedback = self._trajectory_failure_feedback(entry)
+                    if not feedback:
+                        feedback = build_answer_comparison_feedback(
+                            question,
+                            agent_answer,
+                            ground_truth,
+                            self._trajectory_failure_type(entry) or category,
+                            domain_hints=self.config.error_surface_hints,
+                        )
+                    batch_failures.append(
+                        (trace, agent_answer, ground_truth, category, feedback)
+                    )
+                    questions.append(question)
+
+                _log(
+                    "SWEEP",
+                    (
+                        f"Batch {batch_idx}/{total_batches} [{ftype}] "
+                        f"{len(chunk)} failure(s); seed={seed}"
+                    ),
+                )
+                self._iter_cost = 0.0
+                mutation_result = await self._mutate_with_fallback(
+                    seed,
+                    batch_failures,
+                    f"sweep-{batch_idx}",
+                    questions=questions,
+                )
+                self._total_cost += self._iter_cost
+                if mutation_result is None:
+                    _log("SWEEP", "  proposer/generator failed; seed unchanged")
+                    continue
+
+                child_name = mutation_result.child_name
+                self.manager.switch_to(child_name)
+
+                new_skills = [
+                    a.get("skill_name")
+                    for a in mutation_result.applied_skills
+                    if a.get("skill_name")
+                ] or [mutation_result.skill_name or ""]
+                new_skills = [s for s in new_skills if s]
+
+                # Optional over-trigger gate. When disabled (default) the sweep is
+                # a pure generation phase: every successfully generated skill is
+                # accepted into the seed and quality is deferred to PUCT + frontier
+                # distillation. The gate is the single most expensive sweep step
+                # (verifier authoring runs on the slow evolution model), so it is
+                # off by default to keep the sweep fast.
+                if self.config.sweep_self_test_gate:
+                    self._iter_cost = 0.0
+                    if new_skills:
+                        await self._author_verifier_tests(new_skills)
+                        tests = await self._run_executable_skill_tests(new_skills)
+                    else:
+                        tests = None
+                    self._total_cost += self._iter_cost
+
+                    if self._has_failed_negative_self_test(tests):
+                        _log(
+                            "SWEEP",
+                            f"  [REJECT] {child_name}: over-triggers (negative self-test failed)",
+                        )
+                        self.manager.discard(child_name)
+                        self.manager.switch_to(seed)
+                        continue
+
+                # Record which questions each skill is meant to fix; these become its
+                # recall probes during calibration. Only attribute a skill to the batch
+                # that FIRST produced it (its creation): a later batch editing the same
+                # skill must not pollute its target set with that batch's unrelated
+                # questions, which previously dragged the tuned description off-topic.
+                for sk in new_skills:
+                    if sk not in target_map:
+                        target_map[sk] = list(questions)
+
+                seed = child_name
+                accepted += 1
+                n_skills = len(self._get_active_skills())
+                _log(
+                    "SWEEP",
+                    f"  [ACCEPT] seed={seed} (skills={n_skills}, accepted={accepted})",
+                )
+
+        # Re-impose the active-skill budget; the sweep ran unlimited so every
+        # distinct mechanism could be created without being folded.
+        self.config.max_active_skills = _saved_budget
+
+        _log(
+            "SWEEP",
+            (
+                f"Done: {accepted}/{total_batches} batch skills accepted; "
+                f"seed program = {seed} with {len(self._get_active_skills())} skill(s)"
+            ),
+        )
+
+        if self.config.calibrate_trigger_fit and seed != "base":
+            seed = await self._calibrate_trigger_fit(
+                seed, target_map, all_successes_ext or []
+            )
+
+        return seed
+
+    # ------------------------------------------------------------------ #
+    # Trigger-fit calibration                                              #
+    # ------------------------------------------------------------------ #
+
+    def _read_active_skill_descriptions(self) -> dict[str, str]:
+        """Map each active skill name -> its frontmatter description (deployed surface)."""
+        out: dict[str, str] = {}
+        skills_dir = self._project_root / ".claude" / "skills"
+        if not skills_dir.exists():
+            return out
+        for skill_dir in sorted(skills_dir.iterdir()):
+            md = skill_dir / "SKILL.md"
+            if skill_dir.is_dir() and md.exists():
+                out[skill_dir.name] = self._skill_description_from_markdown(
+                    md.read_text()
+                )
+        return out
+
+    @staticmethod
+    def _parse_invoke_list(text: str, valid: set[str]) -> set[str]:
+        """Extract the router's ``{"invoke": [...]}`` skill list, intersected with valid names."""
+        import json
+        import re
+
+        chosen: set[str] = set()
+        blob = text or ""
+        start, end = blob.find("{"), blob.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(blob[start : end + 1])
+                items = data.get("invoke", []) if isinstance(data, dict) else []
+                if isinstance(items, list):
+                    chosen = {str(x).strip() for x in items}
+            except (json.JSONDecodeError, AttributeError):
+                chosen = set()
+        if not chosen:
+            # Fallback: any valid skill name mentioned verbatim in the response.
+            for name in valid:
+                if re.search(rf"\b{re.escape(name)}\b", blob):
+                    chosen.add(name)
+        return {c for c in chosen if c in valid}
+
+    async def _probe_skill_invocation(
+        self,
+        descriptions: dict[str, str],
+        question: str,
+        provider: str,
+        model: str,
+    ) -> set[str]:
+        """One cheap router call: which skills would a fast agent invoke for this task?
+
+        Shows ONLY name+description (exactly the skill list the deployed agent sees)
+        and biases toward literal matching to approximate the small flash model that
+        actually decides invocation in production.
+        """
+        skill_block = "\n".join(
+            f"- {name}: {desc}" for name, desc in descriptions.items()
+        )
+        prompt = (
+            "You simulate a fast assistant deciding which optional skills to invoke "
+            "for ONE task. You see a SKILL LIST (name + description only — exactly what "
+            "the assistant sees before invoking) and the task.\n\n"
+            "Invoke a skill ONLY when the task LITERALLY and OBVIOUSLY matches the "
+            "trigger conditions stated in its description. Do not infer, do not be "
+            "helpful: a fast model skips any skill whose description does not clearly "
+            "fit, and most tasks invoke zero skills.\n\n"
+            f"SKILL LIST:\n{skill_block}\n\n"
+            f"TASK:\n{self._compact_judge_text(question, max_chars=700)}\n\n"
+            'Return JSON only: {"invoke": ["<skill-name>", ...]} (empty list if none).'
+        )
+        try:
+            text = await self._call_judge_api(
+                prompt, provider, model, max_output_tokens=200
+            )
+        except Exception as exc:  # noqa: BLE001 - probe must never abort the run
+            _log("CALIBRATE", f"  [WARN] probe failed: {exc}")
+            return set()
+        return self._parse_invoke_list(text, set(descriptions))
+
+    async def _measure_trigger_fit(
+        self,
+        descriptions: dict[str, str],
+        target_map: dict[str, list[str]],
+        holdout_qs: list[str],
+        provider: str,
+        model: str,
+        only_skills: set[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Probe firing on each skill's target failures (recall) + shared passes (false_trigger)."""
+        cap_t = max(1, self.config.trigger_probe_targets)
+        # Per-skill target probe questions (dedup, capped).
+        skill_targets: dict[str, list[str]] = {}
+        for name in descriptions:
+            if only_skills is not None and name not in only_skills:
+                continue
+            seen: list[str] = []
+            for q in target_map.get(name, []):
+                if q not in seen:
+                    seen.append(q)
+                if len(seen) >= cap_t:
+                    break
+            skill_targets[name] = seen
+
+        unique_qs = list(
+            {q for qs in skill_targets.values() for q in qs} | set(holdout_qs)
+        )
+        if not unique_qs:
+            return {}
+
+        semaphore = asyncio.Semaphore(max(1, self.config.judge_concurrency))
+
+        async def run_one(q: str) -> tuple[str, set[str]]:
+            async with semaphore:
+                return q, await self._probe_skill_invocation(
+                    descriptions, q, provider, model
+                )
+
+        results = await asyncio.gather(*(run_one(q) for q in unique_qs))
+        invoked_by_q: dict[str, set[str]] = dict(results)
+
+        fit: dict[str, dict[str, Any]] = {}
+        for name, tqs in skill_targets.items():
+            hit_t = [q for q in tqs if name in invoked_by_q.get(q, set())]
+            false_hits = [q for q in holdout_qs if name in invoked_by_q.get(q, set())]
+            recall = (len(hit_t) / len(tqs)) if tqs else 0.0
+            ftrig = (len(false_hits) / len(holdout_qs)) if holdout_qs else 0.0
+            fit[name] = {
+                "recall": recall,
+                "false_trigger": ftrig,
+                "n_targets": len(tqs),
+                "missed_targets": [q for q in tqs if q not in hit_t],
+                "false_hits": false_hits,
+            }
+        return fit
+
+    async def _tune_skill_description(
+        self,
+        skill: str,
+        current_desc: str,
+        info: dict[str, Any],
+        provider: str,
+        model: str,
+    ) -> bool:
+        """Rewrite a skill's description to fix measured over/under-triggering.
+
+        Returns True if the SKILL.md description line was changed.
+        """
+        md_path = self._project_root / ".claude" / "skills" / skill / "SKILL.md"
+        if not md_path.exists():
+            return False
+        too_narrow = info["recall"] < self.config.trigger_recall_min
+        too_broad = info["false_trigger"] > self.config.trigger_false_trigger_max
+        if not (too_narrow or too_broad):
+            return False
+
+        md = md_path.read_text()
+        # Anchor the rewrite to what the skill ACTUALLY does. Without the body, the
+        # tuner broadened low-recall skills to match whatever the should-fire probe
+        # questions looked like (mostly gas/thermo here), drifting the description
+        # completely off the skill's mechanism. The body is the source of truth.
+        purpose = self._skill_purpose_summary(md)
+
+        missed = [self._compact_judge_text(q, max_chars=200) for q in info["missed_targets"][:4]]
+        false_hits = [self._compact_judge_text(q, max_chars=200) for q in info["false_hits"][:4]]
+        directive = []
+        if too_narrow:
+            directive.append(
+                f"recall={info['recall']:.2f} is LOW: among tasks THIS skill's mechanism "
+                "applies to, the description is too narrow/abstract to be recognized. Make it "
+                "name the concrete cues of ITS OWN mechanism — do not adopt the topic of the "
+                "SHOULD-FIRE tasks if they fall outside this skill's purpose."
+            )
+        if too_broad:
+            directive.append(
+                f"false_trigger={info['false_trigger']:.2f} is HIGH: the description fires on "
+                "tasks outside this skill's mechanism. Add a sharp scope so it stays dormant on "
+                "the SHOULD-NOT-FIRE tasks; avoid generic openers like 'when computing a number'."
+            )
+        prompt = (
+            "Rewrite ONE skill's `description` line (the only text a fast assistant sees "
+            "before invoking). You may ONLY adjust how broad/specific it is and add "
+            "exclusions. You must NOT change the skill's topic or mechanism — the "
+            "description must stay faithful to WHAT THIS SKILL DOES, described below.\n\n"
+            f"Skill name: {skill}\n"
+            f"What this skill actually does (from its body — the source of truth):\n{purpose}\n\n"
+            f"Current description: {current_desc}\n\n"
+            f"Problem to fix: {' '.join(directive)}\n\n"
+            "SHOULD-FIRE tasks (it currently misses some of these):\n"
+            + ("\n".join(f"- {q}" for q in missed) or "- (none)")
+            + "\n\nSHOULD-NOT-FIRE tasks (must NOT match these):\n"
+            + ("\n".join(f"- {q}" for q in false_hits) or "- (none)")
+            + "\n\nIf the SHOULD-FIRE tasks are NOT about this skill's mechanism, do not "
+            "broaden toward them — they are mis-attributed; return the current description "
+            "unchanged. Return JSON only: {\"description\": \"<one line, <= 60 words, starts "
+            "with 'Invoke when ...', faithful to this skill's mechanism>\"}."
+        )
+        try:
+            text = await self._call_judge_api(
+                prompt, provider, model, max_output_tokens=300
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log("CALIBRATE", f"  [WARN] tune {skill} failed: {exc}")
+            return False
+
+        import json
+
+        new_desc = ""
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                new_desc = str(json.loads(text[start : end + 1]).get("description", "")).strip()
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                new_desc = ""
+        new_desc = " ".join(new_desc.split())
+        if len(new_desc) < 15 or new_desc == current_desc.strip():
+            return False
+        # Drift guard: reject a rewrite that wandered off the skill's actual topic
+        # (shares almost no salient vocabulary with the skill name + body).
+        if not self._description_on_topic(new_desc, skill, md):
+            _log("CALIBRATE", f"  [SKIP tune] {skill}: rewrite drifted off-topic, keeping original")
+            return False
+        md_path.write_text(self._force_frontmatter_description(md, new_desc))
+        _log("CALIBRATE", f"  tuned [{skill}]: {new_desc[:90]}")
+        return True
+
+    async def _restore_faithful_descriptions(self, skills: list[str]) -> None:
+        """Re-derive each skill's description from its body (repairs corruption).
+
+        Used on sweep-resume: a prior buggy calibration could have rewritten
+        descriptions to topics unrelated to the skill's body. This regenerates a
+        faithful, concrete one-line trigger from the body, with the same drift guard
+        the tuner uses, so a description can never wander off the skill's mechanism.
+        """
+        provider, model = self._detect_judge_provider_and_model()
+        if provider == "codex":
+            _log("CALIBRATE", "skipped description repair (codex judge)")
+            return
+        sem = asyncio.Semaphore(max(1, self.config.judge_concurrency))
+
+        async def fix_one(skill: str) -> None:
+            md_path = self._project_root / ".claude" / "skills" / skill / "SKILL.md"
+            if not md_path.exists():
+                return
+            md = md_path.read_text()
+            purpose = self._skill_purpose_summary(md)
+            prompt = (
+                "Write the `description` line for a repo-local skill — the ONLY text a "
+                "fast assistant sees before invoking it. Base it STRICTLY on what the "
+                "skill does (below); never introduce a topic absent from the body. It "
+                "should match every task where this skill's mechanism is the risk and "
+                "stay off other tasks.\n\n"
+                f"Skill name: {skill}\n"
+                f"What this skill does (from its body):\n{purpose}\n\n"
+                "Return JSON only: {\"description\": \"<one line, <= 60 words, starts with "
+                "'Invoke when ...', concrete cues of THIS skill's mechanism>\"}."
+            )
+            async with sem:
+                try:
+                    text = await self._call_judge_api(prompt, provider, model, max_output_tokens=300)
+                except Exception as exc:  # noqa: BLE001
+                    _log("CALIBRATE", f"  [WARN] desc repair {skill} failed: {exc}")
+                    return
+            import json
+
+            new_desc = ""
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    new_desc = str(json.loads(text[start : end + 1]).get("description", "")).strip()
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    new_desc = ""
+            new_desc = " ".join(new_desc.split())
+            if len(new_desc) < 15 or not self._description_on_topic(new_desc, skill, md):
+                _log("CALIBRATE", f"  [keep] {skill}: repair rejected (drift/empty), leaving as-is")
+                return
+            md_path.write_text(self._force_frontmatter_description(md, new_desc))
+            _log("CALIBRATE", f"  [repaired] {skill}: {new_desc[:90]}")
+
+        await asyncio.gather(*(fix_one(s) for s in skills))
+
+    @staticmethod
+    def _skill_purpose_summary(markdown: str, max_chars: int = 700) -> str:
+        """Extract a compact 'what this skill does' anchor from its body sections."""
+        import re
+
+        parts: list[str] = []
+        for header in ("When To Use", "Failure Mechanism", "Procedure"):
+            m = re.search(
+                rf"(?im)^##\s*{re.escape(header)}\s*$(.+?)(?=^##\s|\Z)",
+                markdown,
+                re.DOTALL | re.M,
+            )
+            if m:
+                body = " ".join(m.group(1).split())
+                if body:
+                    parts.append(f"{header}: {body}")
+            if sum(len(p) for p in parts) > max_chars:
+                break
+        summary = " | ".join(parts)
+        return summary[:max_chars] if summary else "(skill body unavailable)"
+
+    @staticmethod
+    def _description_on_topic(new_desc: str, skill_name: str, markdown: str) -> bool:
+        """True if the rewritten description shares salient vocabulary with the skill.
+
+        Guards against the tuner replacing a description with one about a different
+        topic. Compares content words of the candidate against the skill name + body;
+        a near-zero overlap means the rewrite drifted off the skill's mechanism.
+        """
+        import re
+
+        _STOP = {
+            "invoke", "when", "the", "a", "an", "and", "or", "of", "to", "for", "in",
+            "with", "that", "this", "is", "are", "be", "on", "as", "by", "from", "it",
+            "its", "problem", "task", "asks", "answer", "value", "numeric", "compute",
+            "computing", "calculate", "given", "using", "use", "where", "which", "not",
+            "only", "output", "result", "any", "all", "must", "should", "no", "if",
+        }
+        def toks(text: str) -> set[str]:
+            return {
+                w for w in re.findall(r"[a-z][a-z0-9-]{3,}", text.lower())
+                if w not in _STOP
+            }
+        anchor = toks(skill_name.replace("-", " ")) | toks(markdown)
+        cand = toks(new_desc)
+        if not cand:
+            return False
+        overlap = len(cand & anchor) / len(cand)
+        return overlap >= 0.30
+
+    async def _calibrate_trigger_fit(
+        self,
+        seed: str,
+        target_map: dict[str, list[str]],
+        all_successes_ext: list[tuple[Any, ...]],
+    ) -> str:
+        """Measure description-level firing, tune descriptions, keep best-fitting budget.
+
+        Runs once after the sweep. Replaces arrival-order freeze-and-fold: every
+        distinct mechanism the sweep created competes on measured trigger-fit, and
+        the active-skill budget is filled by value (recall × stay-quiet) rather than
+        by which skill happened to be generated first.
+        """
+        provider, model = self._detect_judge_provider_and_model()
+        if provider == "codex":
+            _log("CALIBRATE", "skipped (codex judge does not support free-form router probes)")
+            return seed
+
+        self.manager.switch_to(seed)
+        descriptions = self._read_active_skill_descriptions()
+        if not descriptions:
+            return seed
+
+        # Shared false-trigger probe pool: a sample of PASSING tasks (the agent must
+        # stay dormant on these). Sample across categories for breadth.
+        holdout_qs: list[str] = []
+        for entry in all_successes_ext:
+            q = str(entry[1]) if len(entry) > 1 else ""
+            if q:
+                holdout_qs.append(q)
+        import random as _random
+        _random.Random(0).shuffle(holdout_qs)
+        holdout_qs = holdout_qs[: max(1, self.config.trigger_probe_holdout)]
+
+        _log(
+            "CALIBRATE",
+            (
+                f"Trigger-fit on {len(descriptions)} skill(s): probing recall over "
+                f"targets + false-trigger over {len(holdout_qs)} held-out pass(es)..."
+            ),
+        )
+        fit = await self._measure_trigger_fit(
+            descriptions, target_map, holdout_qs, provider, model
+        )
+        for name, info in sorted(fit.items()):
+            _log(
+                "CALIBRATE",
+                f"  [{name}] recall={info['recall']:.2f} false_trigger={info['false_trigger']:.2f}",
+            )
+
+        # --- Description tuning rounds ---
+        for round_idx in range(1, max(0, self.config.trigger_tune_rounds) + 1):
+            to_tune = {
+                name
+                for name, info in fit.items()
+                if info["recall"] < self.config.trigger_recall_min
+                or info["false_trigger"] > self.config.trigger_false_trigger_max
+            }
+            if not to_tune:
+                break
+            changed = False
+            for name in sorted(to_tune):
+                if await self._tune_skill_description(
+                    name, descriptions.get(name, ""), fit[name], provider, model
+                ):
+                    changed = True
+            if not changed:
+                break
+            self.manager.commit(f"{seed}: calibrate skill descriptions (round {round_idx})")
+            descriptions = self._read_active_skill_descriptions()
+            refit = await self._measure_trigger_fit(
+                descriptions, target_map, holdout_qs, provider, model, only_skills=to_tune
+            )
+            fit.update(refit)
+            for name in sorted(to_tune):
+                info = fit[name]
+                _log(
+                    "CALIBRATE",
+                    f"  [{name}] re-probe recall={info['recall']:.2f} "
+                    f"false_trigger={info['false_trigger']:.2f}",
+                )
+
+        # --- Value-based budget: keep the best-fitting max_active_skills ---
+        budget = self.config.max_active_skills
+        active = list(descriptions)
+        if self.config.trigger_fit_evict_to_budget and budget and len(active) > budget:
+            def fit_score(name: str) -> float:
+                # Net value of the skill's deployed firing: it helps the tasks it
+                # targets (recall) but a skill that fires on tasks it cannot help is
+                # actively harmful (the eval showed over-triggering LOWERS pass rate),
+                # so false-triggering is penalized harder than dormancy. A quiet,
+                # never-firing skill (recall 0, ft 0 -> 0) outranks an over-triggering
+                # one (recall 1, ft 1 -> -1) and is evicted only after it.
+                info = fit.get(name, {"recall": 0.0, "false_trigger": 1.0})
+                return info["recall"] - 2.0 * info["false_trigger"]
+
+            ranked = sorted(active, key=fit_score, reverse=True)
+            evict = ranked[budget:]
+            _log(
+                "CALIBRATE",
+                (
+                    f"Budget {budget}: evicting {len(evict)} lowest trigger-fit skill(s): "
+                    + ", ".join(
+                        f"{n}(fit={fit_score(n):.2f})" for n in evict
+                    )
+                ),
+            )
+            self._remove_skill_dirs(evict)
+            self.manager.commit(f"{seed}: trigger-fit budget prune ({len(evict)} evicted)")
+
+        _log(
+            "CALIBRATE",
+            f"Done: seed {seed} retains {len(self._get_active_skills())} skill(s)",
+        )
+        return seed
 
     def _select_puct_node(self, root: ProgramSearchNode) -> ProgramSearchNode:
         """Select the next expandable parent by global PUCT score.
@@ -5363,7 +6213,8 @@ Each distilled skill must:
         - The full agent is never re-run during the evolution loop.
         """
         # 0. Handle continue mode / feedback reset
-        if not self.config.continue_mode:
+        resume_seed_cfg = getattr(self.config, "sweep_resume_seed", "") or ""
+        if not self.config.continue_mode and not resume_seed_cfg:
             if self.config.reset_feedback and self._feedback_path.exists():
                 self._feedback_path.unlink()
             if self.config.reset_feedback and self._meta_path.exists():
@@ -5376,7 +6227,11 @@ Each distilled skill must:
                 reset_manager()
                 _log("INIT", "Reset local program state for fresh run")
         else:
+            # Resume-from-seed must NOT wipe local_programs (the swept seed lives
+            # there); keep iteration numbering past the existing programs.
             self._iteration_offset = self._get_highest_iteration()
+            if resume_seed_cfg:
+                _log("INIT", f"Sweep-resume mode: preserving programs, reusing seed '{resume_seed_cfg}'")
 
         # 1. Ensure base program exists
         if "base" not in self.manager.list_programs():
@@ -5486,14 +6341,49 @@ Each distilled skill must:
             "JUDGE",
             "Judging primarily on proposal failure mechanisms + aligned held-out + regression",
         )
-        self.manager.update_frontier("base", base_score, max_size=self.config.frontier_size)
+        # Pre-PUCT coverage sweep: generate a skill per failure cluster and chain
+        # the accepted ones into a "seed" program. The seed becomes the PUCT root
+        # and the Bradley-Terry gauge anchor; base survives only as the hidden
+        # base_score (0.70) origin value. When the sweep is disabled or accepts
+        # nothing, seed_name == "base" and behavior is unchanged.
+        resume_seed = getattr(self.config, "sweep_resume_seed", "") or ""
+        if resume_seed and resume_seed in self.manager.list_programs():
+            # Reuse an already-swept seed; skip the expensive sweep and just repair
+            # the skill descriptions with the fixed (body-anchored) logic, then PUCT.
+            _log("SWEEP", f"Resuming from swept seed '{resume_seed}' (skipping sweep)")
+            self.manager.switch_to(resume_seed)
+            # Purge every OTHER program (old sweep intermediates + stale PUCT children
+            # from a prior interrupted run). Otherwise PUCT rebuilds its tree on those
+            # leftover nodes (and their old frontier scores), expanding from stale
+            # children whose descriptions predate this repair. PUCT must start fresh
+            # from the repaired seed only.
+            for prog in self.manager.list_programs():
+                if prog not in ("base", resume_seed):
+                    try:
+                        self.manager.discard(prog)
+                    except Exception as exc:  # noqa: BLE001
+                        _log("SWEEP", f"  [WARN] could not discard stale program {prog}: {exc}")
+            self.manager.switch_to(resume_seed)
+            self._iteration_offset = 0
+            await self._restore_faithful_descriptions(self._get_active_skills())
+            self.manager.commit(f"{resume_seed}: re-derived faithful skill descriptions")
+            seed_name = resume_seed
+        else:
+            seed_name = await self._sweep_failure_coverage(
+                all_failures_ext, all_successes_ext
+            )
+        self._evolution_root = seed_name
+        if seed_name != "base":
+            self.manager.switch_to(seed_name)
+
+        self.manager.update_frontier(seed_name, base_score, max_size=self.config.frontier_size)
         self._emit("baseline", score=base_score, n_skills=len(self._get_active_skills()))
-        search_root = self._build_program_search_tree(base_score)
+        search_root = self._build_program_search_tree(base_score, root_name=seed_name)
         bt_matches: list[BradleyTerryMatch] = []
-        bt_players: set[str] = {"base"}
+        bt_players: set[str] = {seed_name}
         bt_player_judge_results: dict[str, JudgeResult] = {}
         bt_ratings: dict[str, float] = {
-            "base": self.config.judge_elo_initial_rating,
+            seed_name: self.config.judge_elo_initial_rating,
         }
         _log(
             "PUCT",
@@ -6054,6 +6944,13 @@ Each distilled skill must:
                     anchors = sorted(used_anchors)
                     bt_players.update({child_name, *used_anchors})
                     bt_player_judge_results[child_name] = judge_result
+                    # Drop non-informative draws (match_score ~ 0.5): cases the
+                    # narrow skill does not address return "no effect" and, as
+                    # ties, regress every node's rating toward the anchor over
+                    # iterations (scores decay to base). Keeping only decisive
+                    # comparisons preserves real wins and real regression losses
+                    # (over-trigger losses sit far below 0.5 and survive this).
+                    draw_eps = max(0.0, self.config.bt_draw_epsilon)
                     new_bt_matches = [
                         BradleyTerryMatch(
                             player=child_name,
@@ -6067,14 +6964,19 @@ Each distilled skill must:
                         for anchor, result in anchor_results
                         for match in result.matches
                         if match.valid
+                        and abs(match.match_score - 0.5) >= draw_eps
                     ]
                     bt_matches.extend(new_bt_matches)
                     # Only fit over matches where both sides are currently
                     # active (frontier + new child + anchors).  Old discarded
                     # nodes stay in bt_matches for history but must not shift
                     # ratings of present candidates.
+                    # Gauge anchor is the evolution root (seed), not base. base
+                    # only survives as the hidden base_score (0.70) origin value
+                    # the seed maps to. This keeps the league connected to a real,
+                    # judged node so ratings don't float and collapse onto base.
                     _active_players = (
-                        {"base", child_name}
+                        {seed_name, child_name}
                         | {n for n, _ in self.manager.get_frontier_with_scores()}
                         | set(anchors)
                     )
@@ -6084,11 +6986,11 @@ Each distilled skill must:
                     bt_ratings = self._fit_bradley_terry_ratings(
                         _active_bt_matches,
                         sorted(_active_players),
-                        anchor="base",
+                        anchor=seed_name,
                         initial_rating=self.config.judge_elo_initial_rating,
                         scale=self.config.judge_elo_scale,
                     )
-                    base_rating = bt_ratings.get("base", self.config.judge_elo_initial_rating)
+                    anchor_rating = bt_ratings.get(seed_name, self.config.judge_elo_initial_rating)
                     child_rating = bt_ratings.get(child_name, self.config.judge_elo_initial_rating)
                     child_uncertainty = self._bt_player_uncertainty(
                         child_name,
@@ -6097,13 +6999,13 @@ Each distilled skill must:
                     )
                     child_raw_score = self._rating_to_score(
                         child_rating,
-                        base_rating,
+                        anchor_rating,
                         base_score,
                         self.config.judge_elo_scale,
                     )
                     child_score = self._rating_to_score_with_uncertainty(
                         child_rating,
-                        base_rating,
+                        anchor_rating,
                         base_score,
                         self.config.judge_elo_scale,
                         child_uncertainty,
@@ -6117,10 +7019,10 @@ Each distilled skill must:
                             continue
                         rated_score = (
                             base_score
-                            if rated_name == "base"
+                            if rated_name == seed_name
                             else self._rating_to_score_with_uncertainty(
                                 rating,
-                                base_rating,
+                                anchor_rating,
                                 base_score,
                                 self.config.judge_elo_scale,
                                 self._bt_player_uncertainty(
@@ -6145,7 +7047,7 @@ Each distilled skill must:
 
                     expected_win = self._elo_expected(
                         child_rating,
-                        base_rating,
+                        anchor_rating,
                         self.config.judge_elo_scale,
                     )
                     avg_new_match = (
@@ -6157,7 +7059,7 @@ Each distilled skill must:
                         "",
                         (
                             f"  -> Judge BT: global_rating={child_rating:.1f} "
-                            f"base_rating={base_rating:.1f}, expected_vs_base={expected_win:.3f}, "
+                            f"anchor_rating={anchor_rating:.1f}, expected_vs_anchor={expected_win:.3f}, "
                             f"avg_match={avg_new_match:.3f} "
                             f"matches={len(new_bt_matches)} anchors={len(anchors)} "
                             f"uncertainty={child_uncertainty:.3f} "

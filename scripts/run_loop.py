@@ -82,7 +82,16 @@ class LocalProgramManager:
 
     def switch_to(self, name: str) -> None:
         if name not in self.list_programs():
-            raise ValueError(f"Unknown local program: {name}")
+            # Program may have been renamed by a refine step (e.g. foo -> foo-retry2).
+            # Try to find the latest retry variant; fall back to current state.
+            retry_variants = sorted(
+                p for p in self.list_programs()
+                if p.startswith(name + "-retry") or p.startswith(name + "-r")
+            )
+            if retry_variants:
+                name = retry_variants[-1]
+            else:
+                raise ValueError(f"Unknown local program: {name}")
         self._restore_claude_snapshot(name)
         self._write_state(current=name)
 
@@ -509,6 +518,157 @@ class LoopSettings(BaseSettings):
             "Defaults to auto-detection from cwd."
         ),
     )
+    tolerance_csv: Optional[str] = Field(
+        default=None,
+        description=(
+            "CSV file with per-task tolerance values (e.g. SciSkillBench tasks_no_orca.csv). "
+            "When set, uses the official dataset scorer instead of _score_multi_tolerance. "
+            "CSV must have 'question', 'ground_truth', and 'tolerance' columns."
+        ),
+    )
+    scibench_scorer: bool = Field(
+        default=False,
+        description=(
+            "Use SciBench official scorer: 1% relative tolerance on numeric answers. "
+            "Extracts ANSWER: <number> pattern or last number in response."
+        ),
+    )
+    enable_multi_skill: bool = Field(
+        default=False,
+        description="Allow a single child to create or edit multiple skills per mutation step.",
+    )
+    sweep_resume_seed: str = Field(
+        default="",
+        description="Reuse an already-swept seed program (skip the sweep, repair descriptions, go to PUCT).",
+    )
+
+
+def _build_sciskillbench_scorer(tolerance_csv: str):
+    """Build a scorer using per-task tolerances from a SciSkillBench-style CSV."""
+    import csv as _csv
+    import re
+
+    tol_map: dict[str, str] = {}
+    with open(tolerance_csv) as f:
+        for row in _csv.DictReader(f):
+            tol_map[row["question"].strip()] = row["tolerance"]
+
+    def _score_numeric(text: str, expected: float, tolerance: float) -> float:
+        nums = re.findall(r"-?\d+\.?\d*(?:e[+-]?\d+)?", text.replace(",", ""))
+        if not nums:
+            return 0.0
+        for num_str in reversed(nums):
+            try:
+                if abs(float(num_str) - expected) <= tolerance:
+                    return 1.0
+            except ValueError:
+                continue
+        return 0.0
+
+    def _score_list(text: str, expected: list, tolerance) -> float:
+        scores = []
+        for i, item in enumerate(expected):
+            tol = tolerance[i] if isinstance(tolerance, list) and i < len(tolerance) else tolerance
+            try:
+                tol_f = float(tol) if isinstance(tol, (int, float)) else float(tol)
+            except (TypeError, ValueError):
+                tol_f = 0.01
+            if isinstance(item, (int, float)):
+                scores.append(_score_numeric(text, float(item), tol_f))
+            elif isinstance(item, str):
+                scores.append(1.0 if item.lower() in text.lower() else 0.0)
+            elif isinstance(item, list):
+                scores.append(_score_list(text, item, tol))
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def _compare(predicted_text: str, expected, tolerance) -> float:
+        # Extract answer: prefer "ANSWER:" pattern, fall back to last line
+        extracted = None
+        for pat in [
+            r"ANSWER:\s*(.+?)(?:\n|$)",
+            r"final answer[:\s]+(.+?)(?:\n|$)",
+            r"result[:\s]+(.+?)(?:\n|$)",
+        ]:
+            m = re.search(pat, predicted_text, re.IGNORECASE)
+            if m:
+                extracted = m.group(1).strip()
+                break
+        if extracted is None:
+            lines = [l.strip() for l in predicted_text.strip().splitlines() if l.strip()]
+            extracted = lines[-1] if lines else ""
+        if not extracted:
+            return 0.0
+
+        def _numeric_tol(tol):
+            if isinstance(tol, (int, float)):
+                return float(tol)
+            if isinstance(tol, str):
+                try:
+                    return float(tol)
+                except (ValueError, TypeError):
+                    return None
+            return None
+
+        if isinstance(expected, (int, float)):
+            tol_val = _numeric_tol(tolerance)
+            if tol_val is None:
+                tol_val = 0.0
+            return _score_numeric(extracted, float(expected), tol_val)
+        elif isinstance(expected, list):
+            return _score_list(extracted, expected, tolerance)
+        elif isinstance(expected, str):
+            tol_str = str(tolerance).lower() if tolerance else ""
+            if "semantic" in tol_str:
+                return 1.0 if (
+                    expected.strip().lower() in extracted.lower()
+                    or extracted.lower() in expected.strip().lower()
+                ) else 0.0
+            return 1.0 if extracted.strip().lower() == expected.strip().lower() else 0.0
+        return 0.0
+
+    def scorer(question: str, predicted: str, ground_truth: str) -> float:
+        import json as _json
+        tol_str = tol_map.get(question.strip(), "0.01")
+        try:
+            expected = _json.loads(ground_truth)
+            tolerance = _json.loads(tol_str)
+        except Exception:
+            return 0.0
+        score = _compare(predicted, expected, tolerance)
+        return score
+
+    return scorer
+
+
+def _build_scibench_scorer():
+    """Build a scorer using 1% relative tolerance (SciBench official standard)."""
+    import re
+
+    def _extract(text: str) -> str:
+        m = re.search(r"ANSWER:\s*([+-]?\d+\.?\d*(?:e[+-]?\d+)?)", text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+        if lines:
+            nums = re.findall(r"[+-]?\d+\.?\d*(?:e[+-]?\d+)?", lines[-1].replace(",", ""))
+            if nums:
+                return nums[-1]
+        return ""
+
+    def scorer(question: str, predicted: str, ground_truth: str) -> float:
+        ex = _extract(predicted)
+        if not ex:
+            return 0.0
+        try:
+            pred = float(ex)
+            gt = float(str(ground_truth).strip().lstrip("+"))
+        except ValueError:
+            return 0.0
+        if abs(gt) < 1e-10:
+            return 1.0 if abs(pred) < 1e-10 else 0.0
+        return 1.0 if abs(pred - gt) / abs(gt) <= 0.01 else 0.0
+
+    return scorer
 
 
 def stratified_split(
@@ -718,11 +878,21 @@ async def main(settings: LoopSettings):
         executable_skill_test_max_cases=settings.executable_skill_test_max_cases,
         executable_skill_test_concurrency=settings.executable_skill_test_concurrency,
         executable_skill_test_timeout_seconds=settings.executable_skill_test_timeout_seconds,
+        enable_multi_skill=settings.enable_multi_skill,
+        sweep_resume_seed=settings.sweep_resume_seed,
     )
 
     model_info = f", model={settings.model}" if settings.model else ""
     traj_info = f", trajectories={settings.trajectories_dir}" if settings.trajectories_dir else ""
     print(f"Running loop with evolution_mode={settings.mode}{model_info}{traj_info}")
+    custom_scorer = None
+    if settings.tolerance_csv and Path(settings.tolerance_csv).exists():
+        custom_scorer = _build_sciskillbench_scorer(settings.tolerance_csv)
+        print(f"Using official SciSkillBench scorer from {settings.tolerance_csv}")
+    elif settings.scibench_scorer:
+        custom_scorer = _build_scibench_scorer()
+        print("Using official SciBench scorer (1% relative tolerance)")
+
     loop = SelfImprovingLoop(
         config,
         agents,
@@ -730,6 +900,7 @@ async def main(settings: LoopSettings):
         train_pools,
         val_data,
         preloaded_trajectories=preloaded_trajectories,
+        scorer=custom_scorer,
     )
     result = await loop.run()
 

@@ -70,10 +70,19 @@ class SkillEdit(BaseModel):
 
     @model_validator(mode="after")
     def validate_edit(self) -> "SkillEdit":
+        # A target_skill always implies editing that existing skill.
+        if self.target_skill:
+            self.action = "edit"
         if self.action == "edit" and not self.target_skill:
             raise ValueError("target_skill is required when action='edit'")
+        # An edit modifies an existing SKILL.md. The generator works from that
+        # file plus the proposal's justification/bullet_ops, so it need not
+        # restate the full skill body or every boundary field. Only a create
+        # must be fully specified.
+        if self.action == "edit":
+            return self
         if not self.proposed_skill.strip():
-            raise ValueError("proposed_skill is required for each skill edit")
+            raise ValueError("proposed_skill is required for a create skill edit")
         missing = [
             name
             for name in (
@@ -183,8 +192,29 @@ class SkillProposerResponse(BaseModel):
                 if not (getattr(self, name) or "").strip():
                     setattr(self, name, getattr(primary, name))
 
+        # A target_skill always implies editing that existing skill.
+        if self.target_skill:
+            self.action = "edit"
         if self.action == "edit" and not self.target_skill:
             raise ValueError("target_skill is required when action='edit'")
+
+        # An edit modifies an existing SKILL.md, so the generator can work from
+        # that file plus the proposal's justification/bullet_ops without the
+        # proposer restating the full skill body or every boundary field. This
+        # is the common case once the seed has accumulated skills — requiring a
+        # full create-style payload there just wastes batches. A create must
+        # still be fully specified.
+        if self.action == "edit":
+            if not (
+                self.proposed_skill.strip()
+                or self.bullet_ops
+                or self.justification.strip()
+            ):
+                raise ValueError(
+                    "an edit needs proposed_skill, bullet_ops, or a justification"
+                )
+            return self
+
         if not self.proposed_skill.strip():
             raise ValueError("proposed_skill is required")
         required_boundary_fields = {

@@ -137,7 +137,7 @@ class Agent(Generic[T]):
         - Structured output validation via the SDK-specific executor
     """
 
-    TIMEOUT_SECONDS = 1200   # 20 minutes per attempt
+    TIMEOUT_SECONDS = 2400   # 40 minutes per attempt
     MAX_RETRIES = 3          # Total attempts before giving up
     INITIAL_BACKOFF = 30     # Seconds to wait after first failure (doubles each retry)
 
